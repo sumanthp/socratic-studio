@@ -7,7 +7,8 @@ import Terminal from "./Terminal";
 import Chat from "./Chat";
 import CurriculumPanel from "./CurriculumPanel";
 import DisplayNameModal from "./DisplayNameModal";
-import { Code2, Globe, Cpu, BookOpen, MessageSquare, Share2, Download, User } from "lucide-react";
+import SnapshotPanel from "./SnapshotPanel";
+import { Code2, Globe, Cpu, BookOpen, MessageSquare, Share2, Download, User, Package, FlaskConical, X, Plus } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { FileEntry } from "@/types";
 import { useSession } from "@/hooks/useSession";
@@ -73,6 +74,12 @@ export default function IDE() {
 
   // ---- Display name modal ------------------------------------------------
   const [showNameModal, setShowNameModal] = useState(false);
+
+  // ---- Phase 4: packages, test mode, snapshots ---------------------------
+  const [packages, setPackages] = useState<string[]>([]);
+  const [pkgInput, setPkgInput] = useState("");
+  const [showPkgPopover, setShowPkgPopover] = useState(false);
+  const [execMode, setExecMode] = useState<"run" | "test">("run");
 
   // ---- Monotonic message sequence counter --------------------------------
   const persistedSeqRef = useRef(0);
@@ -172,6 +179,27 @@ export default function IDE() {
     saveMessages(withSeq);
   }, [sessionId, saveMessages]);
 
+  // ---- Restore from snapshot ---------------------------------------------
+  const handleRestoreSnapshot = useCallback((restoredFiles: FileEntry[]) => {
+    setFiles(restoredFiles);
+    const firstName = restoredFiles[0]?.name ?? "main.py";
+    setActiveFileName(firstName);
+    saveFiles(restoredFiles, firstName);
+  }, [saveFiles]);
+
+  // ---- Package tag helpers -----------------------------------------------
+  const addPackage = useCallback(() => {
+    const name = pkgInput.trim();
+    if (name && !packages.includes(name)) {
+      setPackages(prev => [...prev, name]);
+    }
+    setPkgInput("");
+  }, [pkgInput, packages]);
+
+  const removePackage = useCallback((pkg: string) => {
+    setPackages(prev => prev.filter(p => p !== pkg));
+  }, []);
+
   // ---- Display name submit -----------------------------------------------
   const handleNameSubmit = useCallback(async (name: string) => {
     setShowNameModal(false);
@@ -254,7 +282,7 @@ export default function IDE() {
           </AnimatePresence>
         </div>
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
           {/* Display name */}
           {displayName && (
             <button
@@ -266,6 +294,13 @@ export default function IDE() {
               <span className="text-[9px] font-bold uppercase tracking-widest">{displayName}</span>
             </button>
           )}
+
+          {/* Snapshots */}
+          <SnapshotPanel
+            sessionId={sessionId}
+            currentFiles={files}
+            onRestore={handleRestoreSnapshot}
+          />
 
           {/* Export & Share */}
           <div className="flex items-center gap-1">
@@ -307,11 +342,76 @@ export default function IDE() {
             </button>
           </div>
 
+          {/* Packages popover */}
+          <div className="relative">
+            <button
+              onClick={() => setShowPkgPopover(p => !p)}
+              title="Manage pip packages"
+              className={`flex items-center gap-1.5 h-10 px-3 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all border ${
+                packages.length > 0
+                  ? "bg-amber-500/10 border-amber-500/20 text-amber-400"
+                  : "bg-white/5 border-white/10 text-white/30 hover:text-white/60"
+              }`}
+            >
+              <Package size={11} />
+              {packages.length > 0 && <span>{packages.length}</span>}
+            </button>
+
+            <AnimatePresence>
+              {showPkgPopover && (
+                <motion.div
+                  initial={{ opacity: 0, y: -6, scale: 0.97 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: -6, scale: 0.97 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute top-full right-0 mt-1 w-64 bg-[#0d0d10] border border-white/10 rounded-xl shadow-2xl shadow-black/60 z-50 p-3 flex flex-col gap-2"
+                >
+                  <div className="text-[9px] font-black uppercase tracking-widest text-white/30">Pip Packages</div>
+                  <div className="flex gap-2">
+                    <input
+                      autoFocus
+                      value={pkgInput}
+                      onChange={e => setPkgInput(e.target.value)}
+                      onKeyDown={e => { if (e.key === "Enter") addPackage(); if (e.key === "Escape") setShowPkgPopover(false); }}
+                      placeholder="e.g. requests"
+                      className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-[11px] text-white placeholder-white/20 focus:outline-none focus:border-amber-500/40 font-mono"
+                    />
+                    <button onClick={addPackage} className="px-2 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 rounded-lg transition-all">
+                      <Plus size={12} />
+                    </button>
+                  </div>
+                  {packages.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {packages.map(pkg => (
+                        <span key={pkg} className="flex items-center gap-1 px-2 py-0.5 bg-amber-500/10 border border-amber-500/20 rounded-full text-[10px] text-amber-300/80 font-mono">
+                          {pkg}
+                          <button onClick={() => removePackage(pkg)} className="text-amber-400/50 hover:text-rose-400 transition-colors">
+                            <X size={9} />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <p className="text-[9px] text-white/20 italic">Packages are installed before each run.</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          {/* Run Tests button */}
           <button
-            onClick={() => setExecutionCount(c => c + 1)}
+            onClick={() => { setExecMode("test"); setExecutionCount(c => c + 1); }}
+            className="flex items-center gap-2 px-5 h-10 rounded-xl bg-emerald-950 text-emerald-400 border border-emerald-500/20 font-black text-[10px] uppercase tracking-[0.15em] transition-all hover:bg-emerald-900 hover:scale-[1.03] active:scale-[0.95] shadow-lg"
+          >
+            <FlaskConical size={13} />
+            Tests
+          </button>
+
+          <button
+            onClick={() => { setExecMode("run"); setExecutionCount(c => c + 1); }}
             className="px-8 h-10 rounded-xl bg-white text-black font-black text-[10px] uppercase tracking-[0.25em] transition-all hover:bg-indigo-50 hover:scale-[1.05] active:scale-[0.95] shadow-2xl shadow-white/10 border border-white/20"
           >
-            Run Prototype
+            Run
           </button>
         </div>
       </header>
@@ -396,7 +496,12 @@ export default function IDE() {
               </PanelResizeHandle>
 
               <Panel defaultSize={35} minSize={15} className="bg-black/40 border border-white/5 rounded-3xl overflow-hidden backdrop-blur-sm relative shadow-2xl shadow-black/50">
-                <Terminal files={files} executionCount={executionCount} />
+                <Terminal
+                  files={files}
+                  executionCount={executionCount}
+                  packages={packages.length > 0 ? packages : undefined}
+                  mode={execMode}
+                />
               </Panel>
             </PanelGroup>
           </Panel>

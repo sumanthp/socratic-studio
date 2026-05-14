@@ -38,6 +38,7 @@ class DBSession(Base):
 
     files = relationship("DBSessionFile", back_populates="session", cascade="all, delete-orphan")
     messages = relationship("DBChatMessage", back_populates="session", cascade="all, delete-orphan", order_by="DBChatMessage.seq")
+    snapshots = relationship("DBSnapshot", back_populates="session", cascade="all, delete-orphan", order_by="DBSnapshot.created_at")
 
 
 class DBSessionFile(Base):
@@ -65,6 +66,18 @@ class DBChatMessage(Base):
     created_at = Column(DateTime, default=func.now())
 
     session = relationship("DBSession", back_populates="messages")
+
+
+class DBSnapshot(Base):
+    __tablename__ = "snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(100), nullable=False)
+    files_json = Column(Text, nullable=False)  # JSON array of {name, content}
+    created_at = Column(DateTime, default=func.now())
+
+    session = relationship("DBSession", back_populates="snapshots")
 
 
 def init_db() -> None:

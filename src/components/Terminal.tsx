@@ -10,6 +10,8 @@ const WS_BASE = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").rep
 interface TerminalProps {
   files: FileEntry[];
   executionCount: number;
+  packages?: string[];
+  mode?: "run" | "test";
 }
 
 interface TraceStep {
@@ -19,18 +21,29 @@ interface TraceStep {
 }
 
 interface OutputLine {
-  type: "system" | "stdout" | "stderr" | "plot";
-  text: string;  // for "plot": base64 PNG data
+  type: "system" | "stdout" | "stderr" | "plot" | "test-pass" | "test-fail" | "test-info";
+  text: string;
   id: number;
 }
 
-export default function Terminal({ files, executionCount }: TerminalProps) {
-  const [output, setOutput]           = useState<OutputLine[]>([]);
-  const [isRunning, setIsRunning]     = useState(false);
+function classifyTestLine(text: string): OutputLine["type"] {
+  const t = text.trimStart();
+  if (/^PASSED/.test(t) || / PASSED$/.test(t.trimEnd())) return "test-pass";
+  if (/^FAILED/.test(t) || / FAILED$/.test(t.trimEnd())) return "test-fail";
+  if (/^ERROR/.test(t)) return "test-fail";
+  if (/^\d+ passed/.test(t) || /passed/.test(t)) return "test-pass";
+  if (/failed/.test(t) && /error/.test(t)) return "test-fail";
+  if (/^={3,}/.test(t) || /^-{3,}/.test(t) || /^_{3,}/.test(t)) return "test-info";
+  return "stdout";
+}
+
+export default function Terminal({ files, executionCount, packages, mode = "run" }: TerminalProps) {
+  const [output, setOutput]             = useState<OutputLine[]>([]);
+  const [isRunning, setIsRunning]       = useState(false);
   const [traceHistory, setTraceHistory] = useState<TraceStep[]>([]);
-  const terminalEndRef                = useRef<HTMLDivElement>(null);
-  const traceIdCounter                = useRef(0);
-  const outputIdCounter               = useRef(0);
+  const terminalEndRef                  = useRef<HTMLDivElement>(null);
+  const traceIdCounter                  = useRef(0);
+  const outputIdCounter                 = useRef(0);
 
   useEffect(() => {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -39,6 +52,7 @@ export default function Terminal({ files, executionCount }: TerminalProps) {
   useEffect(() => {
     if (executionCount === 0) return;
 
+    const label = mode === "test" ? "$ pytest -v" : "$ python main.py";
     setOutput([{ type: "system", text: "SIGNAL: INITIALIZING SANDBOX BOOT SEQUENCE...", id: outputIdCounter.current++ }]);
     setIsRunning(true);
     setTraceHistory([]);
@@ -46,8 +60,11 @@ export default function Terminal({ files, executionCount }: TerminalProps) {
     const ws = new WebSocket(`${WS_BASE}/ws/execute`);
 
     ws.onopen = () => {
-      // Send all files so the backend writes them all to the temp dir
-      ws.send(JSON.stringify({ files: files.map(f => ({ name: f.name, content: f.content })) }));
+      ws.send(JSON.stringify({
+        files: files.map(f => ({ name: f.name, content: f.content })),
+        packages: packages ?? [],
+        mode,
+      }));
     };
 
     ws.onmessage = (event) => {
@@ -55,7 +72,7 @@ export default function Terminal({ files, executionCount }: TerminalProps) {
         const data = JSON.parse(event.data);
 
         if (data.status === "running") {
-          setOutput(prev => [...prev, { type: "system", text: "$ python main.py", id: outputIdCounter.current++ }]);
+          setOutput(prev => [...prev, { type: "system", text: label, id: outputIdCounter.current++ }]);
         } else if (data.status === "completed") {
           setOutput(prev => [...prev, { type: "system", text: "\n[SIGNAL TERMINATED: SUCCESS]", id: outputIdCounter.current++ }]);
           setIsRunning(false);
@@ -69,7 +86,8 @@ export default function Terminal({ files, executionCount }: TerminalProps) {
         } else if (data.plot) {
           setOutput(prev => [...prev, { type: "plot", text: data.plot, id: outputIdCounter.current++ }]);
         } else if (data.output) {
-          setOutput(prev => [...prev, { type: "stdout", text: data.output, id: outputIdCounter.current++ }]);
+          const lineType = mode === "test" ? classifyTestLine(data.output) : "stdout";
+          setOutput(prev => [...prev, { type: lineType, text: data.output, id: outputIdCounter.current++ }]);
         } else if (data.error) {
           setOutput(prev => [...prev, { type: "stderr", text: data.error, id: outputIdCounter.current++ }]);
           if (data.status === "error") setIsRunning(false);
@@ -95,7 +113,14 @@ export default function Terminal({ files, executionCount }: TerminalProps) {
       <div className="h-10 flex items-center px-4 justify-between border-b border-white/5 bg-white/[0.02] shrink-0">
         <div className="flex items-center gap-2">
           <TerminalIcon size={12} className="text-emerald-500" />
-          <span className="text-[9px] text-white/40 font-black uppercase tracking-[0.3em]">Execution Sandbox</span>
+          <span className="text-[9px] text-white/40 font-black uppercase tracking-[0.3em]">
+            {mode === "test" ? "Test Runner" : "Execution Sandbox"}
+          </span>
+          {packages && packages.length > 0 && (
+            <span className="text-[8px] text-amber-400/60 bg-amber-500/10 border border-amber-500/15 rounded px-1.5 py-0.5 font-mono">
+              +{packages.length} pkg{packages.length !== 1 ? "s" : ""}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {isRunning && (
@@ -173,9 +198,12 @@ export default function Terminal({ files, executionCount }: TerminalProps) {
             <span
               key={line.id}
               className={`
-                ${line.type === "system" ? "text-indigo-400 font-bold block mb-2" : ""}
-                ${line.type === "stderr" ? "text-rose-400/80 bg-rose-500/5 px-1 rounded" : ""}
-                ${line.type === "stdout" ? "text-white/80" : ""}
+                ${line.type === "system"    ? "text-indigo-400 font-bold block mb-2" : ""}
+                ${line.type === "stderr"    ? "text-rose-400/80 bg-rose-500/5 px-1 rounded" : ""}
+                ${line.type === "stdout"    ? "text-white/80" : ""}
+                ${line.type === "test-pass" ? "text-emerald-400/90 font-mono" : ""}
+                ${line.type === "test-fail" ? "text-rose-400/90 font-mono font-bold" : ""}
+                ${line.type === "test-info" ? "text-white/30 font-mono" : ""}
               `}
             >
               {line.text}

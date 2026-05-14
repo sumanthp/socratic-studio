@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session as DBSessionORM
 from agents.tutor import MultiAgentCouncil
 from knowledge.rag import init_knowledge_base
 from knowledge.learning_paths import LEARNING_PATH, get_module_by_id
-from database import init_db, get_db, DBSession, DBSessionFile, DBChatMessage
+from database import init_db, get_db, DBSession, DBSessionFile, DBChatMessage, DBSnapshot
 
 load_dotenv()
 
@@ -258,6 +258,63 @@ def upsert_messages(session_id: str, body: MessagesPayload, db: DBSessionORM = D
 
 
 # ---------------------------------------------------------------------------
+# Snapshot endpoints
+# ---------------------------------------------------------------------------
+
+class SnapshotCreateRequest(BaseModel):
+    name: str
+    files: List[Dict[str, str]]
+
+
+@app.post("/api/sessions/{session_id}/snapshots", status_code=201)
+def create_snapshot(session_id: str, body: SnapshotCreateRequest, db: DBSessionORM = Depends(get_db)):
+    session = db.get(DBSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    snap = DBSnapshot(
+        session_id=session_id,
+        name=body.name.strip() or "Untitled",
+        files_json=json.dumps(body.files),
+    )
+    db.add(snap)
+    db.commit()
+    db.refresh(snap)
+    return {
+        "id": snap.id,
+        "name": snap.name,
+        "created_at": snap.created_at.isoformat() if snap.created_at else None,
+        "file_count": len(body.files),
+    }
+
+
+@app.get("/api/sessions/{session_id}/snapshots")
+def list_snapshots(session_id: str, db: DBSessionORM = Depends(get_db)):
+    session = db.get(DBSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return [
+        {
+            "id": s.id,
+            "name": s.name,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "files": json.loads(s.files_json),
+        }
+        for s in session.snapshots
+    ]
+
+
+@app.delete("/api/sessions/{session_id}/snapshots/{snapshot_id}", status_code=204)
+def delete_snapshot(session_id: str, snapshot_id: int, db: DBSessionORM = Depends(get_db)):
+    snap = db.query(DBSnapshot).filter(
+        DBSnapshot.id == snapshot_id, DBSnapshot.session_id == session_id
+    ).first()
+    if not snap:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    db.delete(snap)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
 # Chat endpoints
 # ---------------------------------------------------------------------------
 
@@ -340,7 +397,7 @@ async def chat_with_council(request: Request, body: ChatRequest):
 def _prepare_files(payload: dict) -> list[dict]:
     """
     Normalises the WebSocket payload to a list of {name, content} dicts.
-    Accepts both `{files: [...]}` (Phase 2) and `{code: "..."}` (legacy).
+    Accepts both `{files: [...]}` (multi-file) and `{code: "..."}` (legacy).
     Also injects the matplotlib preamble into main.py.
     """
     if "files" in payload:
@@ -355,6 +412,29 @@ def _prepare_files(payload: dict) -> list[dict]:
             break
 
     return files
+
+
+async def _install_packages_subprocess(packages: list[str], cwd: str, ws: WebSocket) -> bool:
+    """Installs pip packages in the subprocess sandbox. Returns True on success."""
+    pkg_list = ", ".join(packages[:5]) + ("..." if len(packages) > 5 else "")
+    await ws.send_json({"trace": {"step": "Package Install", "detail": f"pip install {pkg_list}"}})
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *packages],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            await ws.send_json({"error": f"pip install failed:\n{result.stderr}", "status": "error"})
+            return False
+        await ws.send_json({"output": f"[Installed: {', '.join(packages)}]\n"})
+        return True
+    except subprocess.TimeoutExpired:
+        await ws.send_json({"error": "pip install timed out (60s)", "status": "error"})
+        return False
 
 
 def _write_to_tmpdir(files: list[dict]) -> str:
@@ -385,16 +465,34 @@ async def _send_queue_msg(ws: WebSocket, msg: dict) -> None:
         await ws.send_json({"output": msg["text"]})
 
 
-async def _execute_subprocess(files: list[dict], ws: WebSocket) -> None:
+async def _execute_subprocess(
+    files: list[dict],
+    ws: WebSocket,
+    packages: list[str] | None = None,
+    mode: str = "run",
+) -> None:
     tmp_dir = _write_to_tmpdir(files)
     try:
-        main_path = os.path.join(tmp_dir, "main.py")
-        if not os.path.exists(main_path):
-            await ws.send_json({"error": "No main.py found in project files.", "status": "error"})
-            return
+        if packages:
+            ok = await _install_packages_subprocess(packages, tmp_dir, ws)
+            if not ok:
+                return
+
+        if mode == "test":
+            test_files = [f["name"] for f in files if f["name"].startswith("test_") or f["name"].endswith("_test.py")]
+            if not test_files:
+                await ws.send_json({"error": "No test files found. Create files named test_*.py to run tests.", "status": "error"})
+                return
+            cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short", "--no-header", "-p", "no:cacheprovider"]
+        else:
+            main_path = os.path.join(tmp_dir, "main.py")
+            if not os.path.exists(main_path):
+                await ws.send_json({"error": "No main.py found in project files.", "status": "error"})
+                return
+            cmd = [sys.executable, "-u", main_path]
 
         process = subprocess.Popen(
-            [sys.executable, "-u", main_path],
+            cmd,
             cwd=tmp_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -442,7 +540,12 @@ async def _execute_subprocess(files: list[dict], ws: WebSocket) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-async def _execute_docker(files: list[dict], ws: WebSocket) -> None:
+async def _execute_docker(
+    files: list[dict],
+    ws: WebSocket,
+    packages: list[str] | None = None,
+    mode: str = "run",
+) -> None:
     import docker  # noqa: PLC0415
     client = docker.from_env()
     out_queue: asyncio.Queue = asyncio.Queue()
@@ -450,22 +553,44 @@ async def _execute_docker(files: list[dict], ws: WebSocket) -> None:
     container = None
     tmp_dir = None
 
+    if packages:
+        pkg_list = ", ".join(packages[:5]) + ("..." if len(packages) > 5 else "")
+        await ws.send_json({"trace": {"step": "Package Install", "detail": f"pip install {pkg_list}"}})
+
     def stream_logs():
         nonlocal container, tmp_dir
         try:
             tmp_dir = _write_to_tmpdir(files)
-            main_path = os.path.join(tmp_dir, "main.py")
-            if not os.path.exists(main_path):
-                loop.call_soon_threadsafe(out_queue.put_nowait, ("error", "No main.py found."))
-                return
+
+            if mode == "test":
+                test_files = [f["name"] for f in files if f["name"].startswith("test_") or f["name"].endswith("_test.py")]
+                if not test_files:
+                    loop.call_soon_threadsafe(out_queue.put_nowait, ("error", "No test files found. Create files named test_*.py to run tests."))
+                    return
+                if packages:
+                    run_cmd = f"pip install -q {' '.join(packages)} && python -m pytest -v --tb=short --no-header -p no:cacheprovider"
+                else:
+                    run_cmd = "pip install -q pytest && python -m pytest -v --tb=short --no-header -p no:cacheprovider"
+            else:
+                main_path = os.path.join(tmp_dir, "main.py")
+                if not os.path.exists(main_path):
+                    loop.call_soon_threadsafe(out_queue.put_nowait, ("error", "No main.py found."))
+                    return
+                if packages:
+                    run_cmd = f"pip install -q {' '.join(packages)} && python -u /sandbox/main.py"
+                else:
+                    run_cmd = "python -u /sandbox/main.py"
+
+            # Use network access only when packages need installing; disable otherwise
+            network = "bridge" if (packages or mode == "test") else "none"
 
             container = client.containers.run(
                 DOCKER_IMAGE,
-                ["python", "-u", "/sandbox/main.py"],
+                ["sh", "-c", run_cmd],
                 volumes={tmp_dir: {"bind": "/sandbox", "mode": "ro"}},
                 mem_limit="128m",
                 nano_cpus=500_000_000,
-                network_mode="none",
+                network_mode=network,
                 remove=False,
                 detach=True,
                 stdout=True,
@@ -613,26 +738,31 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             files = _prepare_files(payload)
+            packages: list[str] = [p.strip() for p in payload.get("packages", []) if p.strip()]
+            mode: str = payload.get("mode", "run")
 
             await websocket.send_json({"status": "running"})
             await websocket.send_json({"trace": {"step": "Initialization", "detail": "Allocating sandbox resources..."}})
             await asyncio.sleep(0.3)
-            await websocket.send_json({"trace": {"step": "Static Analysis", "detail": "Validating python syntax and imports..."}})
+            if mode == "test":
+                await websocket.send_json({"trace": {"step": "Test Discovery", "detail": "Scanning for test_*.py files..."}})
+            else:
+                await websocket.send_json({"trace": {"step": "Static Analysis", "detail": "Validating python syntax and imports..."}})
             await asyncio.sleep(0.4)
 
             if DOCKER_AVAILABLE:
                 await websocket.send_json({"trace": {"step": "Environment Boot", "detail": "Launching isolated Docker container..."}})
                 await asyncio.sleep(0.3)
                 try:
-                    await _execute_docker(files, websocket)
+                    await _execute_docker(files, websocket, packages=packages, mode=mode)
                 except Exception:
                     log.exception("Docker execution failed; falling back to subprocess")
-                    await _execute_subprocess(files, websocket)
+                    await _execute_subprocess(files, websocket, packages=packages, mode=mode)
             else:
                 await websocket.send_json({"trace": {"step": "Environment Boot", "detail": "Loading virtual environment and dependencies..."}})
                 await asyncio.sleep(0.3)
                 try:
-                    await _execute_subprocess(files, websocket)
+                    await _execute_subprocess(files, websocket, packages=packages, mode=mode)
                 except Exception:
                     log.exception("Sandbox execution failure")
                     await websocket.send_json({
