@@ -4,6 +4,8 @@ import { useState, useEffect, useRef } from "react";
 import { Terminal as TerminalIcon, RefreshCw, Activity, CheckCircle2, Loader2, ArrowRight } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
+const WS_BASE = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/^http/, "ws");
+
 interface TerminalProps {
   code: string;
   executionCount: number;
@@ -15,14 +17,20 @@ interface TraceStep {
   id: number;
 }
 
+interface OutputLine {
+  type: "system" | "stdout" | "stderr";
+  text: string;
+  id: number;
+}
+
 export default function Terminal({ code, executionCount }: TerminalProps) {
-  const [output, setOutput] = useState<{ type: "system" | "stdout" | "stderr", text: string }[]>([]);
+  const [output, setOutput] = useState<OutputLine[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [traceHistory, setTraceHistory] = useState<TraceStep[]>([]);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const traceIdCounter = useRef(0);
+  const outputIdCounter = useRef(0);
 
-  // Auto-scroll to bottom
   useEffect(() => {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [output]);
@@ -30,12 +38,12 @@ export default function Terminal({ code, executionCount }: TerminalProps) {
   useEffect(() => {
     if (executionCount === 0) return;
 
-    // Reset output and start execution
-    setOutput([{ type: "system", text: "SIGNAL: INITIALIZING SANDBOX BOOT SEQUENCE..." }]);
+    setOutput([{ type: "system", text: "SIGNAL: INITIALIZING SANDBOX BOOT SEQUENCE...", id: outputIdCounter.current++ }]);
     setIsRunning(true);
     setTraceHistory([]);
 
-    const ws = new WebSocket("ws://localhost:8000/ws/execute");
+    const ws = new WebSocket(`${WS_BASE}/ws/execute`);
+    let closed = false;
 
     ws.onopen = () => {
       ws.send(JSON.stringify({ code }));
@@ -44,30 +52,29 @@ export default function Terminal({ code, executionCount }: TerminalProps) {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        
+
         if (data.status === "running") {
-          setOutput(prev => [...prev, { type: "system", text: "$ python main.py" }]);
+          setOutput(prev => [...prev, { type: "system", text: "$ python main.py", id: outputIdCounter.current++ }]);
         } else if (data.status === "completed") {
-          setOutput(prev => [...prev, { type: "system", text: "\n[SIGNAL TERMINATED: SUCCESS]" }]);
+          setOutput(prev => [...prev, { type: "system", text: "\n[SIGNAL TERMINATED: SUCCESS]", id: outputIdCounter.current++ }]);
           setIsRunning(false);
-          const finishedStep = { step: "Finished", detail: "Session closed.", id: traceIdCounter.current++ };
-          setTraceHistory(prev => [finishedStep, ...prev].slice(0, 3));
+          setTraceHistory(prev => [{ step: "Finished", detail: "Session closed.", id: traceIdCounter.current++ }, ...prev].slice(0, 3));
           ws.close();
         } else if (data.trace) {
-          const nextStep = { ...data.trace, id: traceIdCounter.current++ };
-          setTraceHistory(prev => [nextStep, ...prev].slice(0, 3));
+          setTraceHistory(prev => [{ ...data.trace, id: traceIdCounter.current++ }, ...prev].slice(0, 3));
         } else if (data.output) {
-          setOutput(prev => [...prev, { type: "stdout", text: data.output }]);
+          setOutput(prev => [...prev, { type: "stdout", text: data.output, id: outputIdCounter.current++ }]);
         } else if (data.error) {
-          setOutput(prev => [...prev, { type: "stderr", text: data.error }]);
+          setOutput(prev => [...prev, { type: "stderr", text: data.error, id: outputIdCounter.current++ }]);
+          if (data.status === "error") setIsRunning(false);
         }
       } catch (e) {
         console.error("Failed to parse websocket message", e);
       }
     };
 
-    ws.onerror = (error) => {
-      setOutput(prev => [...prev, { type: "stderr", text: "\n[SIGNAL LOSS: UNREACHABLE]" }]);
+    ws.onerror = () => {
+      setOutput(prev => [...prev, { type: "stderr", text: "\n[SIGNAL LOSS: UNREACHABLE]", id: outputIdCounter.current++ }]);
       setIsRunning(false);
     };
 
@@ -76,9 +83,9 @@ export default function Terminal({ code, executionCount }: TerminalProps) {
     };
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
+      closed = true;
+      // Close regardless of readyState — the browser handles no-op on already-closed sockets
+      ws.close();
     };
   }, [executionCount]);
 
@@ -96,30 +103,31 @@ export default function Terminal({ code, executionCount }: TerminalProps) {
               Active
             </span>
           )}
-          <button 
+          <button
             onClick={() => { setOutput([]); setTraceHistory([]); }}
-            className="text-white/20 hover:text-white transition-colors p-1" 
+            className="text-white/20 hover:text-white transition-colors p-1"
+            aria-label="Clear output"
           >
             <RefreshCw size={10} />
           </button>
         </div>
       </div>
 
-      {/* Live Agent Trace - Lab Version */}
+      {/* Live Agent Trace */}
       <div className="px-6 py-5 border-b border-white/5 bg-white/[0.01] min-h-[110px] flex flex-col gap-3 relative">
         <div className="text-[8px] font-black text-white/20 uppercase tracking-[0.4em]">Live Trace Signal</div>
-        
+
         <div className="flex flex-col gap-2.5">
           <AnimatePresence initial={false}>
             {traceHistory.length > 0 ? (
               traceHistory.map((trace, index) => (
-                <motion.div 
+                <motion.div
                   key={trace.id}
                   initial={{ opacity: 0, x: -5 }}
                   animate={{ opacity: 1 - (index * 0.4), x: 0, scale: 1 - (index * 0.03) }}
-                  className={`flex items-center gap-3 ${index === 0 ? 'text-white' : 'text-white/20'}`}
+                  className={`flex items-center gap-3 ${index === 0 ? "text-white" : "text-white/20"}`}
                 >
-                  <div className={`w-1 h-1 rounded-full ${index === 0 ? (trace.step === 'Finished' ? 'bg-emerald-500' : 'bg-indigo-500 animate-pulse') : 'bg-white/10'}`} />
+                  <div className={`w-1 h-1 rounded-full ${index === 0 ? (trace.step === "Finished" ? "bg-emerald-500" : "bg-indigo-500 animate-pulse") : "bg-white/10"}`} />
                   <div className="flex-1 min-w-0 flex items-center gap-2">
                     <span className="text-[10px] font-black uppercase tracking-widest whitespace-nowrap">{trace.step}</span>
                     <span className="text-[10px] opacity-40 truncate font-mono tracking-tighter">[{trace.detail}]</span>
@@ -143,14 +151,14 @@ export default function Terminal({ code, executionCount }: TerminalProps) {
             Laboratory idle. Awaiting command.
           </div>
         )}
-        
-        {output.map((line, i) => (
-          <span 
-            key={i} 
+
+        {output.map((line) => (
+          <span
+            key={line.id}
             className={`
-              ${line.type === 'system' ? 'text-indigo-400 font-bold block mb-2' : ''}
-              ${line.type === 'stderr' ? 'text-rose-400/80 bg-rose-500/5 px-1 rounded' : ''}
-              ${line.type === 'stdout' ? 'text-white/80' : ''}
+              ${line.type === "system" ? "text-indigo-400 font-bold block mb-2" : ""}
+              ${line.type === "stderr" ? "text-rose-400/80 bg-rose-500/5 px-1 rounded" : ""}
+              ${line.type === "stdout" ? "text-white/80" : ""}
             `}
           >
             {line.text}
