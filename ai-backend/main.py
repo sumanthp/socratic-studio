@@ -2,6 +2,7 @@ import json
 import io
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -9,12 +10,12 @@ import threading
 import queue
 import asyncio
 from contextlib import asynccontextmanager
+from typing import List, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict
 from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -22,6 +23,7 @@ from slowapi.errors import RateLimitExceeded
 
 from agents.tutor import MultiAgentCouncil
 from knowledge.rag import init_knowledge_base
+from knowledge.learning_paths import LEARNING_PATH, get_module_by_id
 
 load_dotenv()
 
@@ -29,11 +31,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Docker sandbox setup (optional — falls back to subprocess if unavailable)
+# Constants
+# ---------------------------------------------------------------------------
+
+EXECUTION_TIMEOUT_SECONDS = 10
+DOCKER_IMAGE = "python:3.11-slim"
+PLOT_MARKER = "__OASIS_PLOT__:"
+
+# Prepended to main.py: patches plt.show() to emit a base64 PNG marker
+MATPLOTLIB_PREAMBLE = """\
+import io as __oasis_io, base64 as __oasis_b64
+try:
+    import matplotlib as __oasis_mpl; __oasis_mpl.use('Agg')
+    import matplotlib.pyplot as __oasis_plt
+    def __oasis_show(*a, **kw):
+        buf = __oasis_io.BytesIO()
+        __oasis_plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+        buf.seek(0)
+        print(f\"{PLOT_MARKER}{{__oasis_b64.b64encode(buf.read()).decode()}}\", flush=True)
+        __oasis_plt.close('all')
+    __oasis_plt.show = __oasis_show
+except ImportError:
+    pass
+"""
+
+# ---------------------------------------------------------------------------
+# Docker availability check
 # ---------------------------------------------------------------------------
 
 DOCKER_AVAILABLE = False
-DOCKER_IMAGE = "python:3.11-slim"
+
 
 def _check_docker() -> None:
     global DOCKER_AVAILABLE
@@ -43,12 +70,11 @@ def _check_docker() -> None:
         client.ping()
         try:
             client.images.get(DOCKER_IMAGE)
-            log.info("Docker sandbox ready (image %s cached).", DOCKER_IMAGE)
         except Exception:
             log.info("Pulling Docker image %s ...", DOCKER_IMAGE)
             client.images.pull(DOCKER_IMAGE)
-            log.info("Docker image pulled.")
         DOCKER_AVAILABLE = True
+        log.info("Docker sandbox ready.")
     except Exception as e:
         log.warning("Docker unavailable — using subprocess sandbox: %s", e)
 
@@ -59,11 +85,11 @@ def _check_docker() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting up — initializing knowledge base and checking Docker...")
+    log.info("Startup: initialising knowledge base and checking Docker...")
     await asyncio.to_thread(init_knowledge_base)
     await asyncio.to_thread(_check_docker)
     yield
-    log.info("Shutting down.")
+    log.info("Shutdown.")
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +114,15 @@ council = MultiAgentCouncil()
 
 
 # ---------------------------------------------------------------------------
+# Curriculum endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/curriculum")
+async def get_curriculum():
+    return LEARNING_PATH
+
+
+# ---------------------------------------------------------------------------
 # Chat endpoints
 # ---------------------------------------------------------------------------
 
@@ -96,6 +131,7 @@ class ChatRequest(BaseModel):
     history: List[Dict[str, str]]
     code_context: str
     provider: str = "openai"
+    current_module: Optional[str] = None
 
 
 def _format_history(history: List[Dict[str, str]]):
@@ -105,24 +141,39 @@ def _format_history(history: List[Dict[str, str]]):
     ]
 
 
+def _enrich_context(code_context: str, current_module: Optional[str]) -> str:
+    """Appends current curriculum module info to the code context."""
+    if not current_module:
+        return code_context
+    module = get_module_by_id(current_module)
+    if not module:
+        return code_context
+    return (
+        code_context
+        + f"\n\n[CURRICULUM MODULE: {module['title']}]"
+        + f"\nObjective: {module['objective']}"
+        + f"\nProject: {module['project']}"
+    )
+
+
 @app.post("/api/tutor/chat/stream")
 @limiter.limit("20/minute")
 async def stream_council(request: Request, body: ChatRequest):
-    """SSE endpoint — streams each agent's response as soon as it is ready."""
-    log.info("Stream request. Provider: %s, Message: %.50s...", body.provider, body.message)
+    log.info("Stream request. Provider: %s, Module: %s", body.provider, body.current_module)
     history = _format_history(body.history)
+    enriched = _enrich_context(body.code_context, body.current_module)
 
     async def event_generator():
         try:
             async for msg in council.stream_council_discussion(
                 user_message=body.message,
                 chat_history=history,
-                code_context=body.code_context,
+                code_context=enriched,
                 provider=body.provider,
             ):
                 yield f"data: {json.dumps(msg)}\n\n"
         except asyncio.CancelledError:
-            pass  # client disconnected
+            pass
         finally:
             yield 'data: {"done": true}\n\n'
 
@@ -136,127 +187,149 @@ async def stream_council(request: Request, body: ChatRequest):
 @app.post("/api/tutor/chat")
 @limiter.limit("20/minute")
 async def chat_with_council(request: Request, body: ChatRequest):
-    """Batch endpoint kept for backward compatibility."""
-    log.info("Batch chat request. Provider: %s", body.provider)
     history = _format_history(body.history)
+    enriched = _enrich_context(body.code_context, body.current_module)
     discussion = await council.get_council_discussion_async(
         user_message=body.message,
         chat_history=history,
-        code_context=body.code_context,
+        code_context=enriched,
         provider=body.provider,
     )
     return {"discussion": discussion}
 
 
 # ---------------------------------------------------------------------------
-# Voice tutor WebSocket
+# Execution helpers
 # ---------------------------------------------------------------------------
 
-def _transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/webm") -> str:
-    from openai import OpenAI  # noqa: PLC0415
-    client = OpenAI()
-    ext = mime_type.split("/")[-1].split(";")[0]  # e.g. "webm"
-    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
+def _prepare_files(payload: dict) -> list[dict]:
+    """
+    Normalises the WebSocket payload to a list of {name, content} dicts.
+    Accepts both `{files: [...]}` (Phase 2) and `{code: "..."}` (legacy).
+    Also injects the matplotlib preamble into main.py.
+    """
+    if "files" in payload:
+        files = [{"name": f["name"], "content": f["content"]} for f in payload["files"]]
+    else:
+        files = [{"name": "main.py", "content": payload.get("code", "")}]
+
+    # Inject matplotlib preamble into main.py
+    for f in files:
+        if f["name"] == "main.py":
+            f["content"] = MATPLOTLIB_PREAMBLE + f["content"]
+            break
+
+    return files
+
+
+def _write_to_tmpdir(files: list[dict]) -> str:
+    """Writes files to a fresh temp directory and returns its path."""
+    tmp_dir = tempfile.mkdtemp()
+    for f in files:
+        dest = os.path.join(tmp_dir, f["name"])
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fp:
+            fp.write(f["content"])
+    return tmp_dir
+
+
+def _classify_line(line: str, is_error: bool) -> dict:
+    stripped = line.rstrip()
+    if not is_error and PLOT_MARKER in stripped:
+        return {"type": "plot", "text": stripped.split(PLOT_MARKER, 1)[1]}
+    return {"type": "error" if is_error else "output", "text": line}
+
+
+async def _send_queue_msg(ws: WebSocket, msg: dict) -> None:
+    t = msg["type"]
+    if t == "plot":
+        await ws.send_json({"plot": msg["text"]})
+    elif t == "error":
+        await ws.send_json({"error": msg["text"]})
+    else:
+        await ws.send_json({"output": msg["text"]})
+
+
+async def _execute_subprocess(files: list[dict], ws: WebSocket) -> None:
+    tmp_dir = _write_to_tmpdir(files)
     try:
-        with open(tmp_path, "rb") as f:
-            transcription = client.audio.transcriptions.create(model="whisper-1", file=f)
-        return transcription.text.strip()
+        main_path = os.path.join(tmp_dir, "main.py")
+        if not os.path.exists(main_path):
+            await ws.send_json({"error": "No main.py found in project files.", "status": "error"})
+            return
+
+        process = subprocess.Popen(
+            [sys.executable, "-u", main_path],
+            cwd=tmp_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        out_queue: queue.Queue = queue.Queue()
+
+        def read_stream(stream, is_error: bool = False):
+            for line in iter(stream.readline, ""):
+                if line:
+                    out_queue.put(_classify_line(line, is_error))
+            stream.close()
+
+        t_out = threading.Thread(target=read_stream, args=(process.stdout,), daemon=True)
+        t_err = threading.Thread(target=read_stream, args=(process.stderr, True), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        deadline = asyncio.get_event_loop().time() + EXECUTION_TIMEOUT_SECONDS
+        timed_out = False
+
+        while t_out.is_alive() or t_err.is_alive() or not out_queue.empty():
+            if asyncio.get_event_loop().time() > deadline:
+                process.kill()
+                timed_out = True
+                break
+            try:
+                await _send_queue_msg(ws, out_queue.get_nowait())
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+        process.wait()
+
+        if timed_out:
+            await ws.send_json({"error": f"\nExecution timed out after {EXECUTION_TIMEOUT_SECONDS}s.", "status": "error"})
+        elif process.returncode != 0:
+            await ws.send_json({"error": f"\nProcess exited with code {process.returncode}"})
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _synthesize_speech(text: str) -> bytes:
-    from openai import OpenAI  # noqa: PLC0415
-    client = OpenAI()
-    response = client.audio.speech.create(model="tts-1", voice="nova", input=text)
-    return response.content
-
-
-@app.websocket("/ws/voice-tutor")
-async def voice_tutor_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    log.info("Voice Tutor WebSocket connected")
-
-    try:
-        while True:
-            # Receive a complete audio recording (sent as a Blob by the frontend)
-            audio_bytes = await websocket.receive_bytes()
-            if not audio_bytes:
-                continue
-
-            log.info("Received audio chunk: %d bytes — transcribing...", len(audio_bytes))
-
-            try:
-                transcription = await asyncio.to_thread(_transcribe_audio, audio_bytes)
-            except Exception as e:
-                log.warning("Whisper transcription failed: %s", e)
-                transcription = ""
-
-            if not transcription:
-                log.info("Empty transcription — skipping.")
-                continue
-
-            log.info("Transcribed: %s", transcription)
-            await websocket.send_json({"role": "human", "content": transcription})
-
-            # Get Tutor response only (voice mode is single-agent for low latency)
-            discussion = await council.get_council_discussion_async(
-                user_message=transcription,
-                chat_history=[],
-                code_context="Socratic Studio Voice Mode",
-                provider="openai",
-            )
-            tutor_response = next(
-                (m["content"] for m in discussion if m["role"] == "Tutor"),
-                "I'm listening...",
-            )
-
-            await websocket.send_json({"role": "Tutor", "content": tutor_response})
-
-            # Generate TTS audio and send as binary frame
-            try:
-                audio_response = await asyncio.to_thread(_synthesize_speech, tutor_response)
-                await websocket.send_bytes(audio_response)
-            except Exception as e:
-                log.warning("TTS synthesis failed: %s", e)
-
-    except WebSocketDisconnect:
-        log.info("Voice Tutor WebSocket disconnected")
-    except Exception as e:
-        log.exception("Voice WebSocket error: %s", e)
-        await websocket.close()
-
-
-# ---------------------------------------------------------------------------
-# Code execution WebSocket
-# ---------------------------------------------------------------------------
-
-EXECUTION_TIMEOUT_SECONDS = 10
-
-
-async def _execute_docker(code: str, ws: WebSocket) -> None:
+async def _execute_docker(files: list[dict], ws: WebSocket) -> None:
     import docker  # noqa: PLC0415
     client = docker.from_env()
     out_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
     container = None
+    tmp_dir = None
 
     def stream_logs():
-        nonlocal container
+        nonlocal container, tmp_dir
         try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
-                tmp.write(code)
-                tmp_path = tmp.name
+            tmp_dir = _write_to_tmpdir(files)
+            main_path = os.path.join(tmp_dir, "main.py")
+            if not os.path.exists(main_path):
+                loop.call_soon_threadsafe(out_queue.put_nowait, ("error", "No main.py found."))
+                return
 
             container = client.containers.run(
                 DOCKER_IMAGE,
-                ["python", "-u", "/sandbox/code.py"],
-                volumes={tmp_path: {"bind": "/sandbox/code.py", "mode": "ro"}},
+                ["python", "-u", "/sandbox/main.py"],
+                volumes={tmp_dir: {"bind": "/sandbox", "mode": "ro"}},
                 mem_limit="128m",
-                nano_cpus=500_000_000,  # 0.5 CPU
+                nano_cpus=500_000_000,
                 network_mode="none",
                 remove=False,
                 detach=True,
@@ -264,15 +337,20 @@ async def _execute_docker(code: str, ws: WebSocket) -> None:
                 stderr=True,
             )
             for chunk in container.logs(stream=True, follow=True):
-                text = chunk.decode("utf-8", errors="replace")
-                loop.call_soon_threadsafe(out_queue.put_nowait, ("output", text))
+                line = chunk.decode("utf-8", errors="replace")
+                stripped = line.rstrip()
+                if PLOT_MARKER in stripped:
+                    b64 = stripped.split(PLOT_MARKER, 1)[1]
+                    loop.call_soon_threadsafe(out_queue.put_nowait, ("plot", b64))
+                else:
+                    loop.call_soon_threadsafe(out_queue.put_nowait, ("output", line))
             result = container.wait()
             loop.call_soon_threadsafe(out_queue.put_nowait, ("done", result["StatusCode"]))
         except Exception as e:
             loop.call_soon_threadsafe(out_queue.put_nowait, ("error", str(e)))
         finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             if container:
                 try:
                     container.remove(force=True)
@@ -286,7 +364,7 @@ async def _execute_docker(code: str, ws: WebSocket) -> None:
     timed_out = False
 
     while True:
-        remaining = max(0.05, deadline - loop.time())
+        remaining = max(0.1, deadline - loop.time())
         try:
             msg_type, msg_data = await asyncio.wait_for(out_queue.get(), timeout=remaining)
         except asyncio.TimeoutError:
@@ -305,75 +383,87 @@ async def _execute_docker(code: str, ws: WebSocket) -> None:
         elif msg_type == "error":
             await ws.send_json({"error": msg_data, "status": "error"})
             break
+        elif msg_type == "plot":
+            await ws.send_json({"plot": msg_data})
         else:
             await ws.send_json({"output": msg_data})
 
     thread.join(timeout=2)
-
     if timed_out:
         await ws.send_json({"error": f"\nExecution timed out after {EXECUTION_TIMEOUT_SECONDS}s.", "status": "error"})
 
 
-async def _execute_subprocess(code: str, ws: WebSocket) -> None:
-    tmp_path = None
+# ---------------------------------------------------------------------------
+# Voice tutor WebSocket
+# ---------------------------------------------------------------------------
+
+def _transcribe_audio(audio_bytes: bytes) -> str:
+    from openai import OpenAI  # noqa: PLC0415
+    oai = OpenAI()
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
-            tmp.write(code)
-            tmp_path = tmp.name
-
-        process = subprocess.Popen(
-            [sys.executable, "-u", tmp_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            encoding="utf-8",
-            errors="replace",
-        )
-
-        out_queue: queue.Queue = queue.Queue()
-
-        def read_stream(stream, is_error: bool = False):
-            for line in iter(stream.readline, ""):
-                if line:
-                    out_queue.put({"type": "error" if is_error else "output", "text": line})
-            stream.close()
-
-        t_out = threading.Thread(target=read_stream, args=(process.stdout,), daemon=True)
-        t_err = threading.Thread(target=read_stream, args=(process.stderr, True), daemon=True)
-        t_out.start()
-        t_err.start()
-
-        deadline = asyncio.get_event_loop().time() + EXECUTION_TIMEOUT_SECONDS
-        timed_out = False
-
-        while t_out.is_alive() or t_err.is_alive() or not out_queue.empty():
-            if asyncio.get_event_loop().time() > deadline:
-                process.kill()
-                timed_out = True
-                break
-            try:
-                msg = out_queue.get_nowait()
-                if msg["type"] == "error":
-                    await ws.send_json({"error": msg["text"]})
-                else:
-                    await ws.send_json({"output": msg["text"]})
-            except queue.Empty:
-                await asyncio.sleep(0.05)
-
-        t_out.join(timeout=2)
-        t_err.join(timeout=2)
-        process.wait()
-
-        if timed_out:
-            await ws.send_json({"error": f"\nExecution timed out after {EXECUTION_TIMEOUT_SECONDS}s.", "status": "error"})
-        elif process.returncode != 0:
-            await ws.send_json({"error": f"\nProcess exited with code {process.returncode}"})
-
+        with open(tmp_path, "rb") as f:
+            result = oai.audio.transcriptions.create(model="whisper-1", file=f)
+        return result.text.strip()
     finally:
-        if tmp_path and os.path.exists(tmp_path):
+        if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+
+def _synthesize_speech(text: str) -> bytes:
+    from openai import OpenAI  # noqa: PLC0415
+    oai = OpenAI()
+    return oai.audio.speech.create(model="tts-1", voice="nova", input=text).content
+
+
+@app.websocket("/ws/voice-tutor")
+async def voice_tutor_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    log.info("Voice Tutor WebSocket connected")
+    try:
+        while True:
+            audio_bytes = await websocket.receive_bytes()
+            if not audio_bytes:
+                continue
+            log.info("Received audio: %d bytes", len(audio_bytes))
+            try:
+                transcription = await asyncio.to_thread(_transcribe_audio, audio_bytes)
+            except Exception as e:
+                log.warning("Whisper failed: %s", e)
+                continue
+            if not transcription:
+                continue
+            log.info("Transcribed: %s", transcription)
+            await websocket.send_json({"role": "human", "content": transcription})
+
+            discussion = await council.get_council_discussion_async(
+                user_message=transcription,
+                chat_history=[],
+                code_context="Socratic Studio Voice Mode",
+                provider="openai",
+            )
+            tutor_response = next(
+                (m["content"] for m in discussion if m["role"] == "Tutor"),
+                "I'm listening...",
+            )
+            await websocket.send_json({"role": "Tutor", "content": tutor_response})
+            try:
+                audio_out = await asyncio.to_thread(_synthesize_speech, tutor_response)
+                await websocket.send_bytes(audio_out)
+            except Exception as e:
+                log.warning("TTS failed: %s", e)
+    except WebSocketDisconnect:
+        log.info("Voice Tutor disconnected")
+    except Exception as e:
+        log.exception("Voice WebSocket error: %s", e)
+        await websocket.close()
+
+
+# ---------------------------------------------------------------------------
+# Code execution WebSocket
+# ---------------------------------------------------------------------------
 
 @app.websocket("/ws/execute")
 async def websocket_endpoint(websocket: WebSocket):
@@ -383,10 +473,11 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
             try:
                 payload = json.loads(data)
-                code = payload.get("code", "")
             except json.JSONDecodeError:
                 await websocket.send_json({"error": "Invalid JSON payload", "status": "error"})
                 continue
+
+            files = _prepare_files(payload)
 
             await websocket.send_json({"status": "running"})
             await websocket.send_json({"trace": {"step": "Initialization", "detail": "Allocating sandbox resources..."}})
@@ -398,15 +489,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"trace": {"step": "Environment Boot", "detail": "Launching isolated Docker container..."}})
                 await asyncio.sleep(0.3)
                 try:
-                    await _execute_docker(code, websocket)
+                    await _execute_docker(files, websocket)
                 except Exception:
-                    log.exception("Docker execution failed, falling back to subprocess")
-                    await _execute_subprocess(code, websocket)
+                    log.exception("Docker execution failed; falling back to subprocess")
+                    await _execute_subprocess(files, websocket)
             else:
                 await websocket.send_json({"trace": {"step": "Environment Boot", "detail": "Loading virtual environment and dependencies..."}})
                 await asyncio.sleep(0.3)
                 try:
-                    await _execute_subprocess(code, websocket)
+                    await _execute_subprocess(files, websocket)
                 except Exception:
                     log.exception("Sandbox execution failure")
                     await websocket.send_json({
