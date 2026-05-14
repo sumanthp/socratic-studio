@@ -9,6 +9,20 @@ const WS_BASE  = API_BASE.replace(/^http/, "ws");
 
 const MAX_HISTORY = 10;
 
+type AgentRole = "Architect" | "Auditor" | "Debugger" | "Tutor";
+
+interface Message {
+  role: "human" | AgentRole;
+  content: string;
+  id: number;
+}
+
+// Simplified type used for persistence interchange (no internal id)
+export interface PersistedMessage {
+  role: string;
+  content: string;
+}
+
 interface ChatProps {
   codeContext: string;
   provider: string;
@@ -16,14 +30,8 @@ interface ChatProps {
   activeFileName: string;
   onMilestoneUpdate: (milestone: string) => void;
   onApplyCode: (code: string) => void;
-}
-
-type AgentRole = "Architect" | "Auditor" | "Debugger" | "Tutor";
-
-interface Message {
-  role: "human" | AgentRole;
-  content: string;
-  id: number;
+  initialMessages?: PersistedMessage[];
+  onNewMessages?: (msgs: PersistedMessage[]) => void;
 }
 
 const AGENT_CONFIG: Record<AgentRole, { icon: React.ElementType; color: string; bg: string; border: string }> = {
@@ -121,6 +129,13 @@ function CodeBlock({
 // Main Chat component
 // ---------------------------------------------------------------------------
 
+const WELCOME_MESSAGE: Message = {
+  role: "Tutor",
+  content:
+    "Council initialized. Establishing connection to Multi-Agent Lab...\n\nHello, I'm your Socratic Tutor. The Lead Architect and Security Auditor are standing by. What are we building today?",
+  id: 0,
+};
+
 export default function Chat({
   codeContext,
   provider,
@@ -128,15 +143,10 @@ export default function Chat({
   activeFileName,
   onMilestoneUpdate,
   onApplyCode,
+  initialMessages,
+  onNewMessages,
 }: ChatProps) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: "Tutor",
-      content:
-        "Council initialized. Establishing connection to Multi-Agent Lab...\n\nHello, I'm your Socratic Tutor. The Lead Architect and Security Auditor are standing by. What are we building today?",
-      id: 0,
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([WELCOME_MESSAGE]);
   const [input, setInput]       = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isVoiceMode, setIsVoiceMode] = useState(false);
@@ -147,6 +157,8 @@ export default function Chat({
   const timerRef        = useRef<ReturnType<typeof setInterval> | null>(null);
   const voiceWsRef      = useRef<WebSocket | null>(null);
   const streamAbortRef  = useRef<AbortController | null>(null);
+  const hasInteracted   = useRef(false);
+  const hydrated        = useRef(false);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -161,6 +173,20 @@ export default function Chat({
       }
     };
   }, []);
+
+  // Hydrate from persisted session — only once, only before any user interaction
+  useEffect(() => {
+    if (hydrated.current || hasInteracted.current) return;
+    if (!initialMessages || initialMessages.length === 0) return;
+    hydrated.current = true;
+    const converted: Message[] = initialMessages.map(m => ({
+      role: (m.role === "human" ? "human" : isAgentRole(m.role) ? m.role : "Tutor") as Message["role"],
+      content: m.content,
+      id: msgIdCounter.current++,
+    }));
+    msgIdCounter.current = converted.length + 1;
+    setMessages([WELCOME_MESSAGE, ...converted]);
+  }, [initialMessages]);
 
   // Loading timer
   useEffect(() => {
@@ -234,14 +260,18 @@ export default function Chat({
   const handleSend = useCallback(async () => {
     if (!input.trim() || isLoading) return;
 
+    hasInteracted.current = true;
+
     const userMessage = input.trim();
     setInput("");
-    setMessages(prev => [...prev, { role: "human", content: userMessage, id: msgIdCounter.current++ }]);
+    const humanMsg: Message = { role: "human", content: userMessage, id: msgIdCounter.current++ };
+    setMessages(prev => [...prev, humanMsg]);
     setIsLoading(true);
 
     const controller = new AbortController();
     streamAbortRef.current = controller;
     const timeoutId = setTimeout(() => controller.abort(), 90_000);
+    const roundTripMsgs: PersistedMessage[] = [{ role: "human", content: userMessage }];
 
     try {
       // Cap history to avoid unbounded token growth
@@ -288,24 +318,23 @@ export default function Chat({
           }
           const role: Message["role"] = isAgentRole(data.role) ? data.role : "Tutor";
           setMessages(prev => [...prev, { role, content: data.content!, id: msgIdCounter.current++ }]);
+          roundTripMsgs.push({ role: data.role, content: data.content! });
         }
       }
     } catch (err: unknown) {
       clearTimeout(timeoutId);
       console.error("Chat stream failure", err);
       const isTimeout = err instanceof Error && err.name === "AbortError";
-      setMessages(prev => [...prev, {
-        role: "Tutor",
-        content: isTimeout
-          ? `SIGNAL TIMEOUT: The ${provider} engine is taking too long. Ensure the model is loaded and retry.`
-          : "SIGNAL LOSS: Unable to reach the Council. Please check the backend and retry.",
-        id: msgIdCounter.current++,
-      }]);
+      const errContent = isTimeout
+        ? `SIGNAL TIMEOUT: The ${provider} engine is taking too long. Ensure the model is loaded and retry.`
+        : "SIGNAL LOSS: Unable to reach the Council. Please check the backend and retry.";
+      setMessages(prev => [...prev, { role: "Tutor", content: errContent, id: msgIdCounter.current++ }]);
     } finally {
       setIsLoading(false);
       streamAbortRef.current = null;
+      if (roundTripMsgs.length > 0) onNewMessages?.(roundTripMsgs);
     }
-  }, [input, isLoading, messages, codeContext, provider, currentModule, onMilestoneUpdate]);
+  }, [input, isLoading, messages, codeContext, provider, currentModule, onMilestoneUpdate, onNewMessages]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {

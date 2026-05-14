@@ -1,14 +1,17 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from "react-resizable-panels";
 import Editor from "./Editor";
 import Terminal from "./Terminal";
 import Chat from "./Chat";
 import CurriculumPanel from "./CurriculumPanel";
-import { Code2, Globe, Cpu, BookOpen, MessageSquare } from "lucide-react";
+import DisplayNameModal from "./DisplayNameModal";
+import { Code2, Globe, Cpu, BookOpen, MessageSquare, Share2, Download, User } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { FileEntry } from "@/types";
+import { useSession } from "@/hooks/useSession";
+import type { PersistedMessage } from "./Chat";
 
 const MODULE_IDS = [
   "m1_api_basics",
@@ -37,6 +40,20 @@ if __name__ == "__main__":
 `;
 
 export default function IDE() {
+  // ---- Session persistence -----------------------------------------------
+  const {
+    sessionId,
+    displayName,
+    isLoaded,
+    saveFiles,
+    saveMeta,
+    saveMessages,
+    setDisplayName,
+    initialFiles,
+    initialMessages,
+    initialMeta,
+  } = useSession();
+
   // ---- File state --------------------------------------------------------
   const [files, setFiles] = useState<FileEntry[]>([
     { name: "main.py", content: DEFAULT_CODE },
@@ -53,6 +70,31 @@ export default function IDE() {
 
   // ---- Provider ----------------------------------------------------------
   const [provider, setProvider] = useState("openai");
+
+  // ---- Display name modal ------------------------------------------------
+  const [showNameModal, setShowNameModal] = useState(false);
+
+  // ---- Monotonic message sequence counter --------------------------------
+  const persistedSeqRef = useRef(0);
+
+  // ---- Hydrate from session on load -------------------------------------
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (initialFiles && initialFiles.length > 0) {
+      setFiles(initialFiles);
+    }
+    if (initialMessages) {
+      persistedSeqRef.current = initialMessages.length;
+    }
+    if (initialMeta) {
+      if (initialMeta.provider) setProvider(initialMeta.provider);
+      if (typeof initialMeta.active_module_index === "number") setActiveModuleIndex(initialMeta.active_module_index);
+      if (initialMeta.milestone) setMilestone(initialMeta.milestone);
+      if (initialMeta.active_file_name) setActiveFileName(initialMeta.active_file_name);
+    }
+    if (!displayName) setShowNameModal(true);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoaded]);
 
   // ---- File callbacks ----------------------------------------------------
   const addFile = useCallback((name: string) => {
@@ -73,23 +115,98 @@ export default function IDE() {
   }, [activeFileName]);
 
   const updateFileContent = useCallback((name: string, content: string) => {
-    setFiles(prev => prev.map(f => f.name === name ? { ...f, content } : f));
-  }, []);
+    setFiles(prev => {
+      const updated = prev.map(f => f.name === name ? { ...f, content } : f);
+      saveFiles(updated, activeFileName);
+      return updated;
+    });
+  }, [activeFileName, saveFiles]);
 
   // ---- Apply code from chat agent ----------------------------------------
   const handleApplyCode = useCallback((code: string) => {
-    setFiles(prev => prev.map(f => f.name === activeFileName ? { ...f, content: code } : f));
-  }, [activeFileName]);
+    setFiles(prev => {
+      const updated = prev.map(f => f.name === activeFileName ? { ...f, content: code } : f);
+      saveFiles(updated, activeFileName);
+      return updated;
+    });
+  }, [activeFileName, saveFiles]);
 
   // ---- Curriculum callbacks ----------------------------------------------
   const handleSelectModule = useCallback((index: number) => {
     setActiveModuleIndex(index);
-  }, []);
+    saveMeta({ active_module_index: index });
+  }, [saveMeta]);
 
   const handleLoadStarterCode = useCallback((code: string) => {
-    setFiles(prev => prev.map(f => f.name === "main.py" ? { ...f, content: code } : f));
+    setFiles(prev => {
+      const updated = prev.map(f => f.name === "main.py" ? { ...f, content: code } : f);
+      saveFiles(updated, "main.py");
+      return updated;
+    });
     setActiveFileName("main.py");
-  }, []);
+  }, [saveFiles]);
+
+  // ---- Provider change ---------------------------------------------------
+  const handleProviderChange = useCallback((p: string) => {
+    setProvider(p);
+    saveMeta({ provider: p });
+  }, [saveMeta]);
+
+  // ---- Milestone update --------------------------------------------------
+  const handleMilestoneUpdate = useCallback((m: string) => {
+    setMilestone(m);
+    saveMeta({ milestone: m });
+  }, [saveMeta]);
+
+  // ---- Active file change (from FileTree) --------------------------------
+  const handleActiveChange = useCallback((name: string) => {
+    setActiveFileName(name);
+    saveMeta({ active_file_name: name });
+  }, [saveMeta]);
+
+  // ---- Session messages --------------------------------------------------
+  const handleNewMessages = useCallback((msgs: PersistedMessage[]) => {
+    if (!sessionId) return;
+    const withSeq = msgs.map((m, i) => ({ ...m, seq: persistedSeqRef.current + i }));
+    persistedSeqRef.current += msgs.length;
+    saveMessages(withSeq);
+  }, [sessionId, saveMessages]);
+
+  // ---- Display name submit -----------------------------------------------
+  const handleNameSubmit = useCallback(async (name: string) => {
+    setShowNameModal(false);
+    if (name && name !== "Anonymous") {
+      await setDisplayName(name);
+    }
+  }, [setDisplayName]);
+
+  // ---- Export session as JSON -------------------------------------------
+  const handleExport = useCallback(() => {
+    const payload = {
+      sessionId,
+      displayName,
+      provider,
+      milestone,
+      activeModuleIndex,
+      files,
+      exportedAt: new Date().toISOString(),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `oasis-session-${sessionId?.slice(0, 8) ?? "export"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [sessionId, displayName, provider, milestone, activeModuleIndex, files]);
+
+  // ---- Share link --------------------------------------------------------
+  const handleShare = useCallback(() => {
+    if (!sessionId) return;
+    const url = `${window.location.origin}/share/${sessionId}`;
+    navigator.clipboard.writeText(url).catch(console.error);
+    alert(`Share link copied!\n\n${url}`);
+  }, [sessionId]);
 
   // Code context passed to the chat (all files formatted)
   const codeContext = files
@@ -104,6 +221,9 @@ export default function IDE() {
       <div className="aether-bg" />
       <div className="blueprint-grid" />
       <div className="scan-line" />
+
+      {/* Display name modal */}
+      <DisplayNameModal open={showNameModal} onSubmit={handleNameSubmit} />
 
       {/* Header */}
       <header className="h-16 flex-shrink-0 flex items-center justify-between px-8 mb-6 bg-white/[0.03] border border-white/10 backdrop-blur-3xl rounded-2xl relative z-50 shadow-2xl shadow-indigo-500/5">
@@ -134,18 +254,52 @@ export default function IDE() {
           </AnimatePresence>
         </div>
 
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-4">
+          {/* Display name */}
+          {displayName && (
+            <button
+              onClick={() => setShowNameModal(true)}
+              className="flex items-center gap-2 text-white/30 hover:text-white/60 transition-colors"
+              title="Change display name"
+            >
+              <User size={11} />
+              <span className="text-[9px] font-bold uppercase tracking-widest">{displayName}</span>
+            </button>
+          )}
+
+          {/* Export & Share */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={handleExport}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-white/25 hover:text-white/60 text-[9px] font-black uppercase tracking-widest transition-colors border border-white/5 hover:border-white/10 rounded-lg"
+              title="Export session as JSON"
+            >
+              <Download size={10} />
+              Export
+            </button>
+            <button
+              onClick={handleShare}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-indigo-400/60 hover:text-indigo-300 text-[9px] font-black uppercase tracking-widest transition-colors border border-indigo-500/10 hover:border-indigo-500/30 rounded-lg"
+              title="Copy share link"
+            >
+              <Share2 size={10} />
+              Share
+            </button>
+          </div>
+
+          <div className="h-6 w-px bg-white/10" />
+
           {/* Provider toggle */}
           <div className="flex items-center bg-black/60 p-1 rounded-xl border border-white/5 shadow-2xl">
             <button
-              onClick={() => setProvider("openai")}
+              onClick={() => handleProviderChange("openai")}
               className={`flex items-center gap-2 px-5 py-2 rounded-lg text-[9px] font-black uppercase tracking-[0.15em] transition-all ${provider === "openai" ? "bg-white text-black shadow-xl scale-[1.02]" : "text-white/20 hover:text-white/40"}`}
             >
               <Globe size={11} />
               OpenAI
             </button>
             <button
-              onClick={() => setProvider("ollama")}
+              onClick={() => handleProviderChange("ollama")}
               className={`flex items-center gap-2 px-5 py-2 rounded-lg text-[9px] font-black uppercase tracking-[0.15em] transition-all ${provider === "ollama" ? "bg-indigo-600 text-white shadow-xl shadow-indigo-500/40 scale-[1.02] border border-indigo-400/30" : "text-white/20 hover:text-white/40"}`}
             >
               <Cpu size={11} />
@@ -204,8 +358,10 @@ export default function IDE() {
                   provider={provider}
                   currentModule={currentModuleId}
                   activeFileName={activeFileName}
-                  onMilestoneUpdate={setMilestone}
+                  onMilestoneUpdate={handleMilestoneUpdate}
                   onApplyCode={handleApplyCode}
+                  initialMessages={initialMessages ?? undefined}
+                  onNewMessages={handleNewMessages}
                 />
               ) : (
                 <CurriculumPanel
@@ -229,7 +385,7 @@ export default function IDE() {
                   files={files}
                   activeFileName={activeFileName}
                   onFileChange={updateFileContent}
-                  onActiveChange={setActiveFileName}
+                  onActiveChange={handleActiveChange}
                   onAddFile={addFile}
                   onRemoveFile={removeFile}
                 />
