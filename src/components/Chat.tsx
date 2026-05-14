@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import { Send, Bot, User, Sparkles, Loader2, ShieldAlert, Cpu, Layout, Radio, AlertCircle, Mic, MicOff } from "lucide-react";
+import { useState, useRef, useEffect, useCallback } from "react";
+import { Send, Bot, User, Loader2, ShieldAlert, Cpu, Layout, Radio, Mic, MicOff } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
@@ -22,14 +22,13 @@ interface Message {
 }
 
 const AGENT_CONFIG: Record<AgentRole, { icon: React.ElementType; color: string; bg: string; border: string }> = {
-  Architect: { icon: Layout, color: "text-blue-400", bg: "bg-blue-500/10", border: "border-blue-500/20" },
-  Auditor: { icon: ShieldAlert, color: "text-amber-400", bg: "bg-amber-500/10", border: "border-amber-500/20" },
-  Debugger: { icon: Cpu, color: "text-rose-400", bg: "bg-rose-500/10", border: "border-rose-500/20" },
-  Tutor: { icon: Bot, color: "text-indigo-400", bg: "bg-indigo-500/10", border: "border-indigo-500/20" },
+  Architect: { icon: Layout,     color: "text-blue-400",   bg: "bg-blue-500/10",   border: "border-blue-500/20"   },
+  Auditor:   { icon: ShieldAlert, color: "text-amber-400",  bg: "bg-amber-500/10",  border: "border-amber-500/20"  },
+  Debugger:  { icon: Cpu,        color: "text-rose-400",   bg: "bg-rose-500/10",   border: "border-rose-500/20"   },
+  Tutor:     { icon: Bot,        color: "text-indigo-400", bg: "bg-indigo-500/10", border: "border-indigo-500/20" },
 };
 
 const KNOWN_AGENT_ROLES = new Set<string>(["Architect", "Auditor", "Debugger", "Tutor"]);
-
 function isAgentRole(role: string): role is AgentRole {
   return KNOWN_AGENT_ROLES.has(role);
 }
@@ -45,38 +44,47 @@ export default function Chat({ codeContext, provider, onMilestoneUpdate }: ChatP
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isVoiceMode, setIsVoiceMode] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
   const [timer, setTimer] = useState(0);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const msgIdCounter = useRef(1);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const voiceWsRef = useRef<WebSocket | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const messagesEndRef  = useRef<HTMLDivElement>(null);
+  const msgIdCounter    = useRef(1);
+  const timerRef        = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceWsRef      = useRef<WebSocket | null>(null);
+  const streamAbortRef  = useRef<AbortController | null>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
+  // Auto-scroll
   useEffect(() => {
-    scrollToBottom();
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
 
-  // Clean up voice mode on unmount
+  // Clean up voice WS on unmount
   useEffect(() => {
     return () => {
-      mediaRecorderRef.current?.stop();
+      streamAbortRef.current?.abort();
       if (voiceWsRef.current && voiceWsRef.current.readyState !== WebSocket.CLOSED) {
         voiceWsRef.current.close();
       }
     };
   }, []);
 
-  const toggleVoiceMode = async () => {
+  // Loading timer
+  useEffect(() => {
+    if (isLoading) {
+      setTimer(0);
+      timerRef.current = setInterval(() => setTimer(prev => prev + 1), 1000);
+    } else {
+      if (timerRef.current) clearInterval(timerRef.current);
+    }
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [isLoading]);
+
+  // --------------------------------------------------------------------------
+  // Voice mode — records 5-second segments and sends each as a complete audio
+  // blob for Whisper transcription on the backend.
+  // --------------------------------------------------------------------------
+  const toggleVoiceMode = useCallback(async () => {
     if (isVoiceMode) {
       setIsVoiceMode(false);
-      setIsRecording(false);
-      mediaRecorderRef.current?.stop();
       voiceWsRef.current?.close();
       return;
     }
@@ -85,25 +93,20 @@ export default function Chat({ codeContext, provider, onMilestoneUpdate }: ChatP
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const ws = new WebSocket(`${WS_BASE}/ws/voice-tutor`);
 
-      ws.onopen = () => {
-        console.log("Voice WS connected");
-        setIsVoiceMode(true);
-        setIsRecording(true);
-
-        const recorder = new MediaRecorder(stream);
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-            ws.send(e.data);
-          }
-        };
-        recorder.start(1000);
-        mediaRecorderRef.current = recorder;
-      };
-
       ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.content) {
-          setMessages(prev => [...prev, { role: "Tutor", content: data.content, id: msgIdCounter.current++ }]);
+        // Text frames carry JSON (transcription or tutor response)
+        if (typeof event.data === "string") {
+          const data = JSON.parse(event.data) as { role: string; content: string };
+          const role: Message["role"] = isAgentRole(data.role) ? data.role : data.role === "human" ? "human" : "Tutor";
+          setMessages(prev => [...prev, { role, content: data.content, id: msgIdCounter.current++ }]);
+          return;
+        }
+        // Binary frames carry TTS audio (MP3) — play immediately
+        if (event.data instanceof Blob) {
+          const url = URL.createObjectURL(event.data);
+          const audio = new Audio(url);
+          audio.play().catch(console.error);
+          audio.onended = () => URL.revokeObjectURL(url);
         }
       };
 
@@ -111,87 +114,112 @@ export default function Chat({ codeContext, provider, onMilestoneUpdate }: ChatP
       ws.onclose = () => setIsVoiceMode(false);
       voiceWsRef.current = ws;
 
+      // Record in 5-second segments so each Blob is a valid audio file
+      const recordSegment = () => {
+        if (!voiceWsRef.current || voiceWsRef.current.readyState !== WebSocket.OPEN) return;
+        const chunks: Blob[] = [];
+        const recorder = new MediaRecorder(stream);
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, { type: recorder.mimeType });
+          if (blob.size > 500 && voiceWsRef.current?.readyState === WebSocket.OPEN) {
+            voiceWsRef.current.send(blob);
+          }
+          // Schedule next segment if still in voice mode
+          setTimeout(recordSegment, 200);
+        };
+        recorder.start();
+        setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, 5000);
+      };
+
+      ws.onopen = () => {
+        setIsVoiceMode(true);
+        recordSegment();
+      };
     } catch (err) {
       console.error("Failed to start voice mode", err);
       alert("Microphone access denied or backend unavailable.");
     }
-  };
+  }, [isVoiceMode]);
 
-  useEffect(() => {
-    if (isLoading) {
-      setTimer(0);
-      timerRef.current = setInterval(() => {
-        setTimer(prev => prev + 1);
-      }, 1000);
-    } else {
-      if (timerRef.current) clearInterval(timerRef.current);
-    }
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, [isLoading]);
-
-  const handleSend = async () => {
+  // --------------------------------------------------------------------------
+  // Text chat — consumes the SSE stream endpoint
+  // --------------------------------------------------------------------------
+  const handleSend = useCallback(async () => {
     if (!input.trim() || isLoading) return;
 
     const userMessage = input.trim();
     setInput("");
-
-    const newMessages: Message[] = [...messages, { role: "human", content: userMessage, id: msgIdCounter.current++ }];
-    setMessages(newMessages);
+    setMessages(prev => [...prev, { role: "human", content: userMessage, id: msgIdCounter.current++ }]);
     setIsLoading(true);
 
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 90000);
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    const timeoutId = setTimeout(() => controller.abort(), 90_000);
 
-      const response = await fetch(`${API_BASE}/api/tutor/chat`, {
+    try {
+      const response = await fetch(`${API_BASE}/api/tutor/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
           message: userMessage,
-          history: messages.map(m => ({
-            role: m.role === "human" ? "human" : "ai",
-            content: m.content,
-          })),
+          history: messages.map(m => ({ role: m.role === "human" ? "human" : "ai", content: m.content })),
           code_context: codeContext,
-          provider: provider,
+          provider,
         }),
       });
 
       clearTimeout(timeoutId);
-
       if (!response.ok) throw new Error(`Server error: ${response.status}`);
-      const data = await response.json();
+      if (!response.body) throw new Error("No response body");
 
-      if (data.discussion && Array.isArray(data.discussion)) {
-        for (const msg of data.discussion) {
-          if (msg.role === "Taskmaster") {
-            const milestone = msg.content.replace("MILESTONE: ", "").trim();
-            onMilestoneUpdate(milestone);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        // SSE events are delimited by double newlines
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+
+        for (const event of events) {
+          const line = event.trim();
+          if (!line.startsWith("data: ")) continue;
+          const data = JSON.parse(line.slice(6)) as { role?: string; content?: string; done?: boolean };
+
+          if (data.done) break;
+          if (!data.role || !data.content) continue;
+
+          if (data.role === "Taskmaster") {
+            onMilestoneUpdate(data.content.replace("MILESTONE: ", "").trim());
             continue;
           }
-          const role: Message["role"] = isAgentRole(msg.role) ? msg.role : "Tutor";
-          setMessages(prev => [...prev, { role, content: msg.content, id: msgIdCounter.current++ }]);
-          await new Promise(resolve => setTimeout(resolve, 800));
+
+          const role: Message["role"] = isAgentRole(data.role) ? data.role : "Tutor";
+          setMessages(prev => [...prev, { role, content: data.content!, id: msgIdCounter.current++ }]);
         }
       }
     } catch (err: unknown) {
-      console.error("Chat network failure", err);
-      let errorMsg = "SIGNAL LOSS: Unable to reach the Council. Maintenance required.";
-      if (err instanceof Error && err.name === "AbortError") {
-        errorMsg = `SIGNAL TIMEOUT: The ${provider} engine is taking too long to respond. Please ensure Ollama is running and your GPU is not overloaded.`;
-      }
+      clearTimeout(timeoutId);
+      console.error("Chat stream failure", err);
+      const isTimeout = err instanceof Error && err.name === "AbortError";
       setMessages(prev => [...prev, {
         role: "Tutor",
-        content: errorMsg,
+        content: isTimeout
+          ? `SIGNAL TIMEOUT: The ${provider} engine is taking too long. Ensure the model is loaded and retry.`
+          : "SIGNAL LOSS: Unable to reach the Council. Please check the backend and retry.",
         id: msgIdCounter.current++,
       }]);
     } finally {
       setIsLoading(false);
+      streamAbortRef.current = null;
     }
-  };
+  }, [input, isLoading, messages, codeContext, provider, onMilestoneUpdate]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -219,8 +247,8 @@ export default function Chat({ codeContext, provider, onMilestoneUpdate }: ChatP
         <AnimatePresence initial={false}>
           {messages.map((msg) => {
             const isHuman = msg.role === "human";
-            const config = !isHuman && isAgentRole(msg.role) ? AGENT_CONFIG[msg.role] : null;
-            const Icon = config ? config.icon : User;
+            const config  = !isHuman && isAgentRole(msg.role) ? AGENT_CONFIG[msg.role] : null;
+            const Icon    = config ? config.icon : User;
 
             return (
               <motion.div
@@ -241,8 +269,7 @@ export default function Chat({ codeContext, provider, onMilestoneUpdate }: ChatP
                     text-[12px] leading-relaxed p-4 rounded-xl border
                     ${isHuman
                       ? "text-white bg-white/5 border-white/10"
-                      : `text-white/70 ${config?.bg} ${config?.border}`
-                    }
+                      : `text-white/70 ${config?.bg} ${config?.border}`}
                   `}>
                     <span className="whitespace-pre-wrap">{msg.content}</span>
                   </div>
@@ -252,6 +279,7 @@ export default function Chat({ codeContext, provider, onMilestoneUpdate }: ChatP
           })}
         </AnimatePresence>
 
+        {/* Loading indicator — shows per-agent as they stream in */}
         {isLoading && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex gap-4">
             <div className="w-8 h-8 rounded-lg bg-white/5 border border-white/5 flex items-center justify-center shrink-0">
@@ -286,6 +314,7 @@ export default function Chat({ codeContext, provider, onMilestoneUpdate }: ChatP
           >
             {isVoiceMode ? <MicOff size={18} /> : <Mic size={18} />}
           </button>
+
           <input
             type="text"
             value={input}
