@@ -2,14 +2,18 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from "react-resizable-panels";
+import { motion, AnimatePresence } from "framer-motion";
 import Editor from "./Editor";
 import Terminal from "./Terminal";
 import Chat from "./Chat";
 import CurriculumPanel from "./CurriculumPanel";
 import DisplayNameModal from "./DisplayNameModal";
 import SnapshotPanel from "./SnapshotPanel";
-import { Code2, Globe, Cpu, BookOpen, MessageSquare, Share2, Download, User, Package, FlaskConical, X, Plus } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import {
+  Code2, Globe, Cpu, Share2, Download, User,
+  Package, FlaskConical, X, Plus, ChevronLeft, ChevronRight,
+  PlayCircle,
+} from "lucide-react";
 import type { FileEntry } from "@/types";
 import { useSession } from "@/hooks/useSession";
 import type { PersistedMessage } from "./Chat";
@@ -41,69 +45,39 @@ if __name__ == "__main__":
 `;
 
 export default function IDE() {
-  // ---- Session persistence -----------------------------------------------
   const {
-    sessionId,
-    displayName,
-    isLoaded,
-    saveFiles,
-    saveMeta,
-    saveMessages,
-    setDisplayName,
-    initialFiles,
-    initialMessages,
-    initialMeta,
+    sessionId, displayName, isLoaded, saveFiles, saveMeta, saveMessages,
+    setDisplayName, initialFiles, initialMessages, initialMeta,
   } = useSession();
 
-  // ---- File state --------------------------------------------------------
-  const [files, setFiles] = useState<FileEntry[]>([
-    { name: "main.py", content: DEFAULT_CODE },
-  ]);
+  const [files, setFiles]                   = useState<FileEntry[]>([{ name: "main.py", content: DEFAULT_CODE }]);
   const [activeFileName, setActiveFileName] = useState("main.py");
-
-  // ---- Execution trigger -------------------------------------------------
   const [executionCount, setExecutionCount] = useState(0);
-
-  // ---- Curriculum state --------------------------------------------------
-  const [milestone, setMilestone] = useState("API Basics & Prompting");
+  const [milestone, setMilestone]           = useState("API Basics & Prompting");
   const [activeModuleIndex, setActiveModuleIndex] = useState(0);
-  const [leftTab, setLeftTab] = useState<"council" | "curriculum">("council");
-
-  // ---- Provider ----------------------------------------------------------
-  const [provider, setProvider] = useState("openai");
-
-  // ---- Display name modal ------------------------------------------------
-  const [showNameModal, setShowNameModal] = useState(false);
-
-  // ---- Phase 4: packages, test mode, snapshots ---------------------------
-  const [packages, setPackages] = useState<string[]>([]);
-  const [pkgInput, setPkgInput] = useState("");
+  const [provider, setProvider]             = useState("openai");
+  const [showNameModal, setShowNameModal]   = useState(false);
+  const [showCodePanel, setShowCodePanel]   = useState(true);
+  const [packages, setPackages]             = useState<string[]>([]);
+  const [pkgInput, setPkgInput]             = useState("");
   const [showPkgPopover, setShowPkgPopover] = useState(false);
-  const [execMode, setExecMode] = useState<"run" | "test">("run");
-
-  // ---- Monotonic message sequence counter --------------------------------
+  const [execMode, setExecMode]             = useState<"run" | "test">("run");
   const persistedSeqRef = useRef(0);
 
-  // ---- Hydrate from session on load -------------------------------------
   useEffect(() => {
     if (!isLoaded) return;
-    if (initialFiles && initialFiles.length > 0) {
-      setFiles(initialFiles);
-    }
-    if (initialMessages) {
-      persistedSeqRef.current = initialMessages.length;
-    }
+    if (initialFiles?.length)       setFiles(initialFiles);
+    if (initialMessages)            persistedSeqRef.current = initialMessages.length;
     if (initialMeta) {
-      if (initialMeta.provider) setProvider(initialMeta.provider);
+      if (initialMeta.provider)           setProvider(initialMeta.provider);
       if (typeof initialMeta.active_module_index === "number") setActiveModuleIndex(initialMeta.active_module_index);
-      if (initialMeta.milestone) setMilestone(initialMeta.milestone);
-      if (initialMeta.active_file_name) setActiveFileName(initialMeta.active_file_name);
+      if (initialMeta.milestone)          setMilestone(initialMeta.milestone);
+      if (initialMeta.active_file_name)   setActiveFileName(initialMeta.active_file_name);
     }
     if (!displayName) setShowNameModal(true);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoaded]);
 
-  // ---- File callbacks ----------------------------------------------------
   const addFile = useCallback((name: string) => {
     setFiles(prev => {
       if (prev.find(f => f.name === name)) return prev;
@@ -129,16 +103,15 @@ export default function IDE() {
     });
   }, [activeFileName, saveFiles]);
 
-  // ---- Apply code from chat agent ----------------------------------------
   const handleApplyCode = useCallback((code: string) => {
     setFiles(prev => {
       const updated = prev.map(f => f.name === activeFileName ? { ...f, content: code } : f);
       saveFiles(updated, activeFileName);
       return updated;
     });
+    setShowCodePanel(true);
   }, [activeFileName, saveFiles]);
 
-  // ---- Curriculum callbacks ----------------------------------------------
   const handleSelectModule = useCallback((index: number) => {
     setActiveModuleIndex(index);
     saveMeta({ active_module_index: index });
@@ -151,27 +124,24 @@ export default function IDE() {
       return updated;
     });
     setActiveFileName("main.py");
+    setShowCodePanel(true);
   }, [saveFiles]);
 
-  // ---- Provider change ---------------------------------------------------
   const handleProviderChange = useCallback((p: string) => {
     setProvider(p);
     saveMeta({ provider: p });
   }, [saveMeta]);
 
-  // ---- Milestone update --------------------------------------------------
   const handleMilestoneUpdate = useCallback((m: string) => {
     setMilestone(m);
     saveMeta({ milestone: m });
   }, [saveMeta]);
 
-  // ---- Active file change (from FileTree) --------------------------------
   const handleActiveChange = useCallback((name: string) => {
     setActiveFileName(name);
     saveMeta({ active_file_name: name });
   }, [saveMeta]);
 
-  // ---- Session messages --------------------------------------------------
   const handleNewMessages = useCallback((msgs: PersistedMessage[]) => {
     if (!sessionId) return;
     const withSeq = msgs.map((m, i) => ({ ...m, seq: persistedSeqRef.current + i }));
@@ -179,7 +149,6 @@ export default function IDE() {
     saveMessages(withSeq);
   }, [sessionId, saveMessages]);
 
-  // ---- Restore from snapshot ---------------------------------------------
   const handleRestoreSnapshot = useCallback((restoredFiles: FileEntry[]) => {
     setFiles(restoredFiles);
     const firstName = restoredFiles[0]?.name ?? "main.py";
@@ -187,12 +156,9 @@ export default function IDE() {
     saveFiles(restoredFiles, firstName);
   }, [saveFiles]);
 
-  // ---- Package tag helpers -----------------------------------------------
   const addPackage = useCallback(() => {
     const name = pkgInput.trim();
-    if (name && !packages.includes(name)) {
-      setPackages(prev => [...prev, name]);
-    }
+    if (name && !packages.includes(name)) setPackages(prev => [...prev, name]);
     setPkgInput("");
   }, [pkgInput, packages]);
 
@@ -200,35 +166,22 @@ export default function IDE() {
     setPackages(prev => prev.filter(p => p !== pkg));
   }, []);
 
-  // ---- Display name submit -----------------------------------------------
   const handleNameSubmit = useCallback(async (name: string) => {
     setShowNameModal(false);
-    if (name && name !== "Anonymous") {
-      await setDisplayName(name);
-    }
+    if (name && name !== "Anonymous") await setDisplayName(name);
   }, [setDisplayName]);
 
-  // ---- Export session as JSON -------------------------------------------
   const handleExport = useCallback(() => {
-    const payload = {
-      sessionId,
-      displayName,
-      provider,
-      milestone,
-      activeModuleIndex,
-      files,
-      exportedAt: new Date().toISOString(),
-    };
+    const payload = { sessionId, displayName, provider, milestone, activeModuleIndex, files, exportedAt: new Date().toISOString() };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `oasis-session-${sessionId?.slice(0, 8) ?? "export"}.json`;
+    a.download = `session-${sessionId?.slice(0, 8) ?? "export"}.json`;
     a.click();
     URL.revokeObjectURL(url);
   }, [sessionId, displayName, provider, milestone, activeModuleIndex, files]);
 
-  // ---- Share link --------------------------------------------------------
   const handleShare = useCallback(() => {
     if (!sessionId) return;
     const url = `${window.location.origin}/share/${sessionId}`;
@@ -236,278 +189,255 @@ export default function IDE() {
     alert(`Share link copied!\n\n${url}`);
   }, [sessionId]);
 
-  // Code context passed to the chat (all files formatted)
-  const codeContext = files
-    .map(f => `# === ${f.name} ===\n${f.content}`)
-    .join("\n\n");
-
+  const codeContext = files.map(f => `# === ${f.name} ===\n${f.content}`).join("\n\n");
   const currentModuleId = MODULE_IDS[activeModuleIndex] ?? MODULE_IDS[0];
 
   return (
-    <div className="fixed inset-0 flex flex-col p-6">
-      {/* Background layers */}
+    <div className="fixed inset-0 flex flex-col" style={{ background: "var(--background)" }}>
       <div className="aether-bg" />
       <div className="blueprint-grid" />
-      <div className="scan-line" />
 
-      {/* Display name modal */}
       <DisplayNameModal open={showNameModal} onSubmit={handleNameSubmit} />
 
-      {/* Header */}
-      <header className="h-16 flex-shrink-0 flex items-center justify-between px-8 mb-6 bg-white/[0.03] border border-white/10 backdrop-blur-3xl rounded-2xl relative z-50 shadow-2xl shadow-indigo-500/5">
-        <div className="flex items-center gap-8">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/20 border border-indigo-400/20">
-              <Code2 size={20} className="text-white" />
+      {/* ── Header ─────────────────────────────────────────────────────── */}
+      <header className="h-14 shrink-0 flex items-center justify-between px-6 border-b border-white/[0.07] bg-white/[0.02] backdrop-blur-xl z-50">
+        {/* Left: branding */}
+        <div className="flex items-center gap-5">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/25">
+              <Code2 size={16} className="text-white" />
             </div>
             <div>
-              <h1 className="text-xs font-black tracking-[0.3em] uppercase text-white/95">Oasis</h1>
-              <p className="text-[8px] font-bold text-white/20 uppercase tracking-[0.4em] -mt-0.5">Laboratory.Alpha</p>
+              <div className="text-sm font-bold text-white/90 leading-none">Socratic Studio</div>
+              <div className="text-[10px] text-white/30 leading-none mt-0.5">AI Learning Platform</div>
             </div>
           </div>
 
-          <div className="h-6 w-px bg-white/10" />
+          <div className="h-5 w-px bg-white/[0.08]" />
 
           <AnimatePresence mode="wait">
             <motion.div
               key={milestone}
-              initial={{ opacity: 0, y: -5 }}
+              initial={{ opacity: 0, y: -4 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 5 }}
-              className="flex items-center gap-3 px-4 py-2 bg-indigo-500/5 border border-indigo-500/10 rounded-xl"
+              exit={{ opacity: 0, y: 4 }}
+              className="flex items-center gap-2 px-3 py-1 bg-indigo-500/[0.08] border border-indigo-500/[0.15] rounded-lg"
             >
-              <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)] animate-pulse" />
-              <span className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-100/70">{milestone}</span>
+              <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+              <span className="text-xs font-semibold text-indigo-200/70">{milestone}</span>
             </motion.div>
           </AnimatePresence>
         </div>
 
-        <div className="flex items-center gap-3">
-          {/* Display name */}
+        {/* Right: controls */}
+        <div className="flex items-center gap-2.5">
           {displayName && (
-            <button
-              onClick={() => setShowNameModal(true)}
-              className="flex items-center gap-2 text-white/30 hover:text-white/60 transition-colors"
-              title="Change display name"
-            >
-              <User size={11} />
-              <span className="text-[9px] font-bold uppercase tracking-widest">{displayName}</span>
+            <button onClick={() => setShowNameModal(true)} className="flex items-center gap-1.5 text-white/40 hover:text-white/70 transition-colors px-2 py-1 rounded-lg hover:bg-white/[0.04]">
+              <User size={13} />
+              <span className="text-xs font-medium">{displayName}</span>
             </button>
           )}
 
-          {/* Snapshots */}
-          <SnapshotPanel
-            sessionId={sessionId}
-            currentFiles={files}
-            onRestore={handleRestoreSnapshot}
-          />
+          <SnapshotPanel sessionId={sessionId} currentFiles={files} onRestore={handleRestoreSnapshot} />
 
-          {/* Export & Share */}
-          <div className="flex items-center gap-1">
-            <button
-              onClick={handleExport}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-white/25 hover:text-white/60 text-[9px] font-black uppercase tracking-widest transition-colors border border-white/5 hover:border-white/10 rounded-lg"
-              title="Export session as JSON"
-            >
-              <Download size={10} />
-              Export
-            </button>
-            <button
-              onClick={handleShare}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-indigo-400/60 hover:text-indigo-300 text-[9px] font-black uppercase tracking-widest transition-colors border border-indigo-500/10 hover:border-indigo-500/30 rounded-lg"
-              title="Copy share link"
-            >
-              <Share2 size={10} />
-              Share
-            </button>
-          </div>
+          <button onClick={handleExport} className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-white/35 hover:text-white/65 border border-white/[0.07] hover:border-white/[0.14] rounded-lg transition-all">
+            <Download size={13} />
+            Export
+          </button>
 
-          <div className="h-6 w-px bg-white/10" />
+          <button onClick={handleShare} className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-indigo-300/60 hover:text-indigo-200 border border-indigo-500/[0.15] hover:border-indigo-500/30 rounded-lg transition-all">
+            <Share2 size={13} />
+            Share
+          </button>
+
+          <div className="h-5 w-px bg-white/[0.08]" />
 
           {/* Provider toggle */}
-          <div className="flex items-center bg-black/60 p-1 rounded-xl border border-white/5 shadow-2xl">
+          <div className="flex items-center bg-black/40 rounded-xl border border-white/[0.07] p-0.5">
             <button
               onClick={() => handleProviderChange("openai")}
-              className={`flex items-center gap-2 px-5 py-2 rounded-lg text-[9px] font-black uppercase tracking-[0.15em] transition-all ${provider === "openai" ? "bg-white text-black shadow-xl scale-[1.02]" : "text-white/20 hover:text-white/40"}`}
+              className={`flex items-center gap-1.5 px-4 py-1.5 rounded-[10px] text-xs font-semibold transition-all ${provider === "openai" ? "bg-white text-black shadow-lg" : "text-white/30 hover:text-white/55"}`}
             >
-              <Globe size={11} />
+              <Globe size={12} />
               OpenAI
             </button>
             <button
               onClick={() => handleProviderChange("ollama")}
-              className={`flex items-center gap-2 px-5 py-2 rounded-lg text-[9px] font-black uppercase tracking-[0.15em] transition-all ${provider === "ollama" ? "bg-indigo-600 text-white shadow-xl shadow-indigo-500/40 scale-[1.02] border border-indigo-400/30" : "text-white/20 hover:text-white/40"}`}
+              className={`flex items-center gap-1.5 px-4 py-1.5 rounded-[10px] text-xs font-semibold transition-all ${provider === "ollama" ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/30" : "text-white/30 hover:text-white/55"}`}
             >
-              <Cpu size={11} />
+              <Cpu size={12} />
               Ollama
             </button>
           </div>
-
-          {/* Packages popover */}
-          <div className="relative">
-            <button
-              onClick={() => setShowPkgPopover(p => !p)}
-              title="Manage pip packages"
-              className={`flex items-center gap-1.5 h-10 px-3 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all border ${
-                packages.length > 0
-                  ? "bg-amber-500/10 border-amber-500/20 text-amber-400"
-                  : "bg-white/5 border-white/10 text-white/30 hover:text-white/60"
-              }`}
-            >
-              <Package size={11} />
-              {packages.length > 0 && <span>{packages.length}</span>}
-            </button>
-
-            <AnimatePresence>
-              {showPkgPopover && (
-                <motion.div
-                  initial={{ opacity: 0, y: -6, scale: 0.97 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: -6, scale: 0.97 }}
-                  transition={{ duration: 0.15 }}
-                  className="absolute top-full right-0 mt-1 w-64 bg-[#0d0d10] border border-white/10 rounded-xl shadow-2xl shadow-black/60 z-50 p-3 flex flex-col gap-2"
-                >
-                  <div className="text-[9px] font-black uppercase tracking-widest text-white/30">Pip Packages</div>
-                  <div className="flex gap-2">
-                    <input
-                      autoFocus
-                      value={pkgInput}
-                      onChange={e => setPkgInput(e.target.value)}
-                      onKeyDown={e => { if (e.key === "Enter") addPackage(); if (e.key === "Escape") setShowPkgPopover(false); }}
-                      placeholder="e.g. requests"
-                      className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-[11px] text-white placeholder-white/20 focus:outline-none focus:border-amber-500/40 font-mono"
-                    />
-                    <button onClick={addPackage} className="px-2 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 rounded-lg transition-all">
-                      <Plus size={12} />
-                    </button>
-                  </div>
-                  {packages.length > 0 && (
-                    <div className="flex flex-wrap gap-1.5">
-                      {packages.map(pkg => (
-                        <span key={pkg} className="flex items-center gap-1 px-2 py-0.5 bg-amber-500/10 border border-amber-500/20 rounded-full text-[10px] text-amber-300/80 font-mono">
-                          {pkg}
-                          <button onClick={() => removePackage(pkg)} className="text-amber-400/50 hover:text-rose-400 transition-colors">
-                            <X size={9} />
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  <p className="text-[9px] text-white/20 italic">Packages are installed before each run.</p>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
-
-          {/* Run Tests button */}
-          <button
-            onClick={() => { setExecMode("test"); setExecutionCount(c => c + 1); }}
-            className="flex items-center gap-2 px-5 h-10 rounded-xl bg-emerald-950 text-emerald-400 border border-emerald-500/20 font-black text-[10px] uppercase tracking-[0.15em] transition-all hover:bg-emerald-900 hover:scale-[1.03] active:scale-[0.95] shadow-lg"
-          >
-            <FlaskConical size={13} />
-            Tests
-          </button>
-
-          <button
-            onClick={() => { setExecMode("run"); setExecutionCount(c => c + 1); }}
-            className="px-8 h-10 rounded-xl bg-white text-black font-black text-[10px] uppercase tracking-[0.25em] transition-all hover:bg-indigo-50 hover:scale-[1.05] active:scale-[0.95] shadow-2xl shadow-white/10 border border-white/20"
-          >
-            Run
-          </button>
         </div>
       </header>
 
-      {/* Main workspace */}
-      <main className="flex-1 min-h-0 relative z-10">
-        <PanelGroup direction="horizontal">
+      {/* ── Main 3-column layout ────────────────────────────────────────── */}
+      <div className="flex-1 min-h-0 flex overflow-hidden">
 
-          {/* Left panel: Council + Curriculum tabs */}
-          <Panel defaultSize={28} minSize={20} className="bg-white/[0.01] border border-white/5 rounded-3xl overflow-hidden backdrop-blur-sm relative shadow-2xl shadow-black/50 flex flex-col">
-            <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-indigo-500/30 to-transparent" />
+        {/* Column 1: Curriculum sidebar */}
+        <aside className="w-60 shrink-0 border-r border-white/[0.07] bg-black/20 flex flex-col overflow-hidden">
+          <CurriculumPanel
+            activeModuleIndex={activeModuleIndex}
+            onSelectModule={handleSelectModule}
+            onLoadStarterCode={handleLoadStarterCode}
+          />
+        </aside>
 
-            {/* Tab bar */}
-            <div className="flex border-b border-white/5 shrink-0">
-              <button
-                onClick={() => setLeftTab("council")}
-                className={`flex-1 flex items-center justify-center gap-2 py-3 text-[9px] font-black uppercase tracking-[0.2em] transition-colors ${
-                  leftTab === "council"
-                    ? "text-indigo-300 border-b-2 border-indigo-500 bg-white/[0.02]"
-                    : "text-white/25 hover:text-white/50"
-                }`}
-              >
-                <MessageSquare size={11} />
-                Council
-              </button>
-              <button
-                onClick={() => setLeftTab("curriculum")}
-                className={`flex-1 flex items-center justify-center gap-2 py-3 text-[9px] font-black uppercase tracking-[0.2em] transition-colors ${
-                  leftTab === "curriculum"
-                    ? "text-indigo-300 border-b-2 border-indigo-500 bg-white/[0.02]"
-                    : "text-white/25 hover:text-white/50"
-                }`}
-              >
-                <BookOpen size={11} />
-                Curriculum
-              </button>
-            </div>
+        {/* Column 2: Chat (the learning hero) */}
+        <div className="flex-1 min-w-0 flex flex-col border-r border-white/[0.07]">
+          <Chat
+            codeContext={codeContext}
+            provider={provider}
+            currentModule={currentModuleId}
+            activeFileName={activeFileName}
+            onMilestoneUpdate={handleMilestoneUpdate}
+            onApplyCode={handleApplyCode}
+            initialMessages={initialMessages ?? undefined}
+            onNewMessages={handleNewMessages}
+          />
+        </div>
 
-            {/* Tab content */}
-            <div className="flex-1 min-h-0">
-              {leftTab === "council" ? (
-                <Chat
-                  codeContext={codeContext}
-                  provider={provider}
-                  currentModule={currentModuleId}
-                  activeFileName={activeFileName}
-                  onMilestoneUpdate={handleMilestoneUpdate}
-                  onApplyCode={handleApplyCode}
-                  initialMessages={initialMessages ?? undefined}
-                  onNewMessages={handleNewMessages}
-                />
-              ) : (
-                <CurriculumPanel
-                  activeModuleIndex={activeModuleIndex}
-                  onSelectModule={handleSelectModule}
-                  onLoadStarterCode={handleLoadStarterCode}
-                />
-              )}
-            </div>
-          </Panel>
+        {/* Column 3: Code Workshop (collapsible) */}
+        <AnimatePresence initial={false}>
+          {showCodePanel && (
+            <motion.aside
+              key="code-panel"
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: "42%", opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              transition={{ duration: 0.22, ease: [0.4, 0, 0.2, 1] }}
+              className="shrink-0 flex flex-col overflow-hidden bg-[#090b15]"
+              style={{ minWidth: 0 }}
+            >
+              {/* Workshop toolbar */}
+              <div className="h-11 shrink-0 flex items-center justify-between px-4 border-b border-white/[0.07] bg-white/[0.02]">
+                <span className="text-[11px] font-bold uppercase tracking-widest text-white/25">Code Workshop</span>
+                <div className="flex items-center gap-1.5">
+                  {/* Packages popover */}
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowPkgPopover(p => !p)}
+                      title="Pip packages"
+                      className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
+                        packages.length > 0
+                          ? "bg-amber-500/10 border-amber-500/25 text-amber-400"
+                          : "bg-white/[0.04] border-white/[0.07] text-white/30 hover:text-white/55"
+                      }`}
+                    >
+                      <Package size={11} />
+                      {packages.length > 0 ? `${packages.length} pkg` : "Pkgs"}
+                    </button>
 
-          <PanelResizeHandle className="w-4 group flex items-center justify-center transition-all">
-            <div className="w-px h-12 bg-white/5 group-hover:bg-indigo-500/50 transition-colors shadow-[0_0_10px_rgba(99,102,241,0.5)]" />
-          </PanelResizeHandle>
+                    <AnimatePresence>
+                      {showPkgPopover && (
+                        <motion.div
+                          initial={{ opacity: 0, y: -4, scale: 0.97 }}
+                          animate={{ opacity: 1, y: 0, scale: 1 }}
+                          exit={{ opacity: 0, y: -4, scale: 0.97 }}
+                          transition={{ duration: 0.12 }}
+                          className="absolute top-full right-0 mt-1 w-60 bg-[#0d0f1c] border border-white/10 rounded-xl shadow-2xl shadow-black/60 z-50 p-3 flex flex-col gap-2.5"
+                        >
+                          <div className="text-[10px] font-bold uppercase tracking-widest text-white/30">Pip Packages</div>
+                          <div className="flex gap-2">
+                            <input
+                              autoFocus
+                              value={pkgInput}
+                              onChange={e => setPkgInput(e.target.value)}
+                              onKeyDown={e => { if (e.key === "Enter") addPackage(); if (e.key === "Escape") setShowPkgPopover(false); }}
+                              placeholder="e.g. requests"
+                              className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-amber-500/40 font-mono"
+                            />
+                            <button onClick={addPackage} className="px-2 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 rounded-lg">
+                              <Plus size={13} />
+                            </button>
+                          </div>
+                          {packages.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5">
+                              {packages.map(pkg => (
+                                <span key={pkg} className="flex items-center gap-1 px-2 py-0.5 bg-amber-500/10 border border-amber-500/20 rounded-full text-xs text-amber-300/80 font-mono">
+                                  {pkg}
+                                  <button onClick={() => removePackage(pkg)} className="text-amber-400/50 hover:text-rose-400">
+                                    <X size={9} />
+                                  </button>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <p className="text-[10px] text-white/20 italic">Installed before each run.</p>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
 
-          {/* Right panel: Editor + Terminal */}
-          <Panel defaultSize={72}>
-            <PanelGroup direction="vertical">
-              <Panel defaultSize={65} minSize={30} className="bg-white/[0.01] border border-white/5 rounded-3xl overflow-hidden backdrop-blur-sm flex flex-col relative shadow-2xl shadow-black/50">
-                <Editor
-                  files={files}
-                  activeFileName={activeFileName}
-                  onFileChange={updateFileContent}
-                  onActiveChange={handleActiveChange}
-                  onAddFile={addFile}
-                  onRemoveFile={removeFile}
-                />
-              </Panel>
+                  {/* Run Tests */}
+                  <button
+                    onClick={() => { setExecMode("test"); setExecutionCount(c => c + 1); }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-950 text-emerald-400 border border-emerald-500/20 text-xs font-semibold hover:bg-emerald-900 transition-all active:scale-[0.96]"
+                  >
+                    <FlaskConical size={12} />
+                    Tests
+                  </button>
 
-              <PanelResizeHandle className="h-4 group flex items-center justify-center transition-all">
-                <div className="h-px w-12 bg-white/5 group-hover:bg-indigo-500/50 transition-colors shadow-[0_0_10px_rgba(99,102,241,0.5)]" />
-              </PanelResizeHandle>
+                  {/* Run */}
+                  <button
+                    onClick={() => { setExecMode("run"); setExecutionCount(c => c + 1); }}
+                    className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition-all active:scale-[0.96] shadow-lg shadow-indigo-500/20"
+                  >
+                    <PlayCircle size={13} />
+                    Run
+                  </button>
+                </div>
+              </div>
 
-              <Panel defaultSize={35} minSize={15} className="bg-black/40 border border-white/5 rounded-3xl overflow-hidden backdrop-blur-sm relative shadow-2xl shadow-black/50">
-                <Terminal
-                  files={files}
-                  executionCount={executionCount}
-                  packages={packages.length > 0 ? packages : undefined}
-                  mode={execMode}
-                />
-              </Panel>
-            </PanelGroup>
-          </Panel>
+              {/* Editor + Terminal */}
+              <div className="flex-1 min-h-0">
+                <PanelGroup orientation="vertical">
+                  <Panel defaultSize={63} minSize={30} className="flex flex-col">
+                    <Editor
+                      files={files}
+                      activeFileName={activeFileName}
+                      onFileChange={updateFileContent}
+                      onActiveChange={handleActiveChange}
+                      onAddFile={addFile}
+                      onRemoveFile={removeFile}
+                    />
+                  </Panel>
 
-        </PanelGroup>
-      </main>
+                  <PanelResizeHandle className="h-3 group flex items-center justify-center">
+                    <div className="h-px w-16 bg-white/[0.06] group-hover:bg-indigo-500/40 transition-colors rounded-full" />
+                  </PanelResizeHandle>
+
+                  <Panel defaultSize={37} minSize={15} className="bg-black/50">
+                    <Terminal
+                      files={files}
+                      executionCount={executionCount}
+                      packages={packages.length > 0 ? packages : undefined}
+                      mode={execMode}
+                    />
+                  </Panel>
+                </PanelGroup>
+              </div>
+            </motion.aside>
+          )}
+        </AnimatePresence>
+
+        {/* Toggle tab */}
+        <button
+          onClick={() => setShowCodePanel(p => !p)}
+          title={showCodePanel ? "Hide workshop" : "Open code workshop"}
+          className="w-8 shrink-0 flex flex-col items-center justify-center gap-2.5 border-l border-white/[0.07] bg-black/20 hover:bg-white/[0.04] transition-colors group"
+        >
+          {showCodePanel ? (
+            <ChevronRight size={14} className="text-white/25 group-hover:text-white/50 transition-colors" />
+          ) : (
+            <ChevronLeft size={14} className="text-white/25 group-hover:text-white/50 transition-colors" />
+          )}
+          <span className="text-[9px] font-bold uppercase tracking-widest text-white/15 group-hover:text-white/35 transition-colors" style={{ writingMode: "vertical-lr", rotate: "180deg" }}>
+            Workshop
+          </span>
+        </button>
+      </div>
     </div>
   );
 }

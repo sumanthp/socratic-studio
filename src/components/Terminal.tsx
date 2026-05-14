@@ -108,30 +108,30 @@ export default function Terminal({ files, executionCount, packages, mode = "run"
   }, [executionCount]);
 
   return (
-    <div className="h-full w-full flex flex-col bg-black/60">
+    <div className="h-full w-full flex flex-col bg-[#07090f]">
       {/* Header */}
-      <div className="h-10 flex items-center px-4 justify-between border-b border-white/5 bg-white/[0.02] shrink-0">
+      <div className="h-10 flex items-center px-4 justify-between border-b border-white/[0.06] shrink-0">
         <div className="flex items-center gap-2">
-          <TerminalIcon size={12} className="text-emerald-500" />
-          <span className="text-[9px] text-white/40 font-black uppercase tracking-[0.3em]">
-            {mode === "test" ? "Test Runner" : "Execution Sandbox"}
+          <TerminalIcon size={12} className="text-emerald-400/70" />
+          <span className="text-[11px] font-semibold text-white/30">
+            {mode === "test" ? "Test Runner" : "Output"}
           </span>
           {packages && packages.length > 0 && (
-            <span className="text-[8px] text-amber-400/60 bg-amber-500/10 border border-amber-500/15 rounded px-1.5 py-0.5 font-mono">
+            <span className="text-[10px] text-amber-400/60 bg-amber-500/[0.08] border border-amber-500/15 rounded px-1.5 py-0.5 font-mono">
               +{packages.length} pkg{packages.length !== 1 ? "s" : ""}
             </span>
           )}
         </div>
         <div className="flex items-center gap-2">
           {isRunning && (
-            <span className="text-[9px] text-emerald-500 font-bold uppercase tracking-widest flex items-center gap-1.5 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
-              <Activity size={8} className="animate-pulse" />
-              Active
+            <span className="text-[10px] text-emerald-400 font-medium flex items-center gap-1.5">
+              <Activity size={9} className="animate-pulse" />
+              Running
             </span>
           )}
           <button
             onClick={() => { setOutput([]); setTraceHistory([]); }}
-            className="text-white/20 hover:text-white transition-colors p-1"
+            className="text-white/15 hover:text-white/45 transition-colors p-1 rounded"
             aria-label="Clear output"
           >
             <RefreshCw size={10} />
@@ -140,56 +140,51 @@ export default function Terminal({ files, executionCount, packages, mode = "run"
       </div>
 
       {/* Live trace signal */}
-      <div className="px-6 py-5 border-b border-white/5 bg-white/[0.01] min-h-[110px] flex flex-col gap-3 relative shrink-0">
-        <div className="text-[8px] font-black text-white/20 uppercase tracking-[0.4em]">Live Trace Signal</div>
-        <div className="flex flex-col gap-2.5">
-          <AnimatePresence initial={false}>
-            {traceHistory.length > 0 ? (
-              traceHistory.map((trace, index) => (
-                <motion.div
-                  key={trace.id}
-                  initial={{ opacity: 0, x: -5 }}
-                  animate={{ opacity: 1 - (index * 0.4), x: 0, scale: 1 - (index * 0.03) }}
-                  className={`flex items-center gap-3 ${index === 0 ? "text-white" : "text-white/20"}`}
-                >
-                  <div className={`w-1 h-1 rounded-full shrink-0 ${
-                    index === 0
-                      ? trace.step === "Finished"
-                        ? "bg-emerald-500"
-                        : "bg-indigo-500 animate-pulse"
-                      : "bg-white/10"
-                  }`} />
-                  <div className="flex-1 min-w-0 flex items-center gap-2">
-                    <span className="text-[10px] font-black uppercase tracking-widest whitespace-nowrap">{trace.step}</span>
-                    <span className="text-[10px] opacity-40 truncate font-mono tracking-tighter">[{trace.detail}]</span>
-                  </div>
-                </motion.div>
-              ))
-            ) : (
-              <div className="text-white/5 text-[9px] font-bold uppercase tracking-[0.3em] italic py-1">Standby...</div>
-            )}
-          </AnimatePresence>
-        </div>
+      <div className="px-4 py-2.5 border-b border-white/[0.04] shrink-0 min-h-[60px]">
+        <div className="text-[9px] font-bold uppercase tracking-widest text-white/15 mb-2">Trace</div>
+        <AnimatePresence initial={false}>
+          {traceHistory.length > 0 ? (
+            traceHistory.slice(0, 2).map((trace, index) => (
+              <motion.div
+                key={trace.id}
+                initial={{ opacity: 0, x: -4 }}
+                animate={{ opacity: 1 - index * 0.5, x: 0 }}
+                className="flex items-center gap-2 mb-1"
+              >
+                <div className={`w-1 h-1 rounded-full shrink-0 ${
+                  index === 0
+                    ? trace.step === "Finished" ? "bg-emerald-400" : "bg-indigo-400 animate-pulse"
+                    : "bg-white/10"
+                }`} />
+                <span className={`text-[10px] font-mono ${index === 0 ? "text-white/55" : "text-white/20"}`}>
+                  {trace.step}
+                  <span className="text-white/20 ml-1.5">{trace.detail}</span>
+                </span>
+              </motion.div>
+            ))
+          ) : (
+            <div className="text-[10px] text-white/10 italic">Standby…</div>
+          )}
+        </AnimatePresence>
       </div>
 
       {/* Output console */}
-      <div className="flex-1 p-6 font-mono text-[12px] overflow-y-auto leading-relaxed custom-scrollbar">
+      <div className="flex-1 px-4 py-3 font-mono text-[12.5px] overflow-y-auto leading-relaxed custom-scrollbar">
         {output.length === 0 && traceHistory.length === 0 && (
-          <div className="text-white/5 italic flex items-center gap-2 select-none">
-            <span className="text-indigo-500/20 font-bold">&gt;</span>
-            Laboratory idle. Awaiting command.
+          <div className="text-white/[0.08] italic text-sm">
+            Run your code to see output here.
           </div>
         )}
 
         {output.map(line => {
           if (line.type === "plot") {
             return (
-              <div key={line.id} className="my-4">
-                <div className="text-[9px] text-indigo-400/50 font-black uppercase tracking-widest mb-2">Plot Output</div>
+              <div key={line.id} className="my-3">
+                <div className="text-[9px] text-indigo-400/40 font-bold uppercase tracking-widest mb-2">Plot Output</div>
                 <img
                   src={`data:image/png;base64,${line.text}`}
                   alt="Plot output"
-                  className="max-w-full rounded-xl border border-white/10 shadow-2xl shadow-black/50"
+                  className="max-w-full rounded-xl border border-white/10 shadow-2xl"
                 />
               </div>
             );
@@ -198,12 +193,12 @@ export default function Terminal({ files, executionCount, packages, mode = "run"
             <span
               key={line.id}
               className={`
-                ${line.type === "system"    ? "text-indigo-400 font-bold block mb-2" : ""}
-                ${line.type === "stderr"    ? "text-rose-400/80 bg-rose-500/5 px-1 rounded" : ""}
-                ${line.type === "stdout"    ? "text-white/80" : ""}
-                ${line.type === "test-pass" ? "text-emerald-400/90 font-mono" : ""}
-                ${line.type === "test-fail" ? "text-rose-400/90 font-mono font-bold" : ""}
-                ${line.type === "test-info" ? "text-white/30 font-mono" : ""}
+                ${line.type === "system"    ? "text-indigo-400/70 font-semibold block mb-1.5" : ""}
+                ${line.type === "stderr"    ? "text-rose-400/80" : ""}
+                ${line.type === "stdout"    ? "text-white/70" : ""}
+                ${line.type === "test-pass" ? "text-emerald-400" : ""}
+                ${line.type === "test-fail" ? "text-rose-400 font-bold" : ""}
+                ${line.type === "test-info" ? "text-white/25" : ""}
               `}
             >
               {line.text}
